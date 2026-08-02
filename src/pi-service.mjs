@@ -151,10 +151,16 @@ function summarizeEntry(entry, includeContent) {
   return boundedValue(summary, { maxString: 1000 });
 }
 
-function jobSnapshot(job, includeEvents = true) {
+// Compact-by-default run snapshot. The compact form keeps everything needed to
+// continue (ids, status, timing, errors, pending UI requests) without the
+// diagnostic payload; includeDetails restores the full snapshot. tool_calls is
+// intentionally omitted from the detailed form because it is fully redundant
+// with the bounded recent_events stream (tool_execution_start/end summaries).
+export function jobSnapshot(job, options = {}) {
   if (!job) {
     return null;
   }
+  const includeDetails = Boolean(options.includeDetails);
   const output = {
     run_id: job.id,
     status: job.status,
@@ -162,15 +168,19 @@ function jobSnapshot(job, includeEvents = true) {
     settled_at: job.settledAt || null,
     prompt_kind: job.kind,
     error: job.error || null,
-    result: job.result || null,
-    pending_ui_requests: Array.from(job.uiRequests.values()),
-    tool_calls: job.toolCalls.slice(-30),
-    streamed_message_updates: job.messageUpdates
+    pending_ui_requests: Array.from(job.uiRequests.values())
   };
-  if (includeEvents) {
+  if (includeDetails) {
+    output.result = job.result || null;
+    output.streamed_message_updates = job.messageUpdates;
     output.recent_events = job.events.slice(-30);
   }
   return output;
+}
+
+function jobAnswer(job) {
+  const answer = job?.result?.assistant_text;
+  return typeof answer === "string" && answer.trim() ? answer : null;
 }
 
 function activeProcessCount(sessions) {
@@ -236,7 +246,7 @@ export class PiService {
     return session;
   }
 
-  liveSummary(session, includeJob = false) {
+  liveSummary(session, jobOptions = null) {
     const result = {
       session_id: session.id,
       lifecycle: session.lifecycle,
@@ -254,8 +264,9 @@ export class PiService {
       protocol_warnings: session.rpc.protocolWarnings.slice(-5),
       pending_ui_requests: Array.from(session.uiRequests.values())
     };
-    if (includeJob) {
-      result.job = jobSnapshot(session.job);
+    if (jobOptions) {
+      const options = jobOptions === true ? { includeDetails: true } : jobOptions;
+      result.job = jobSnapshot(session.job, options);
     }
     return boundedValue(result, { maxDepth: 8, maxItems: 80, maxString: this.config.resultLimit });
   }
@@ -436,12 +447,17 @@ export class PiService {
       return this.wait({
         session_id: session.session_id,
         run_id: dispatched.run_id,
-        timeout_seconds: input.wait_seconds
+        timeout_seconds: input.wait_seconds,
+        include_details: input.include_details
       });
     }
+    const liveSession = this.getSession(session.session_id);
     return {
-      session: this.liveSummary(this.getSession(session.session_id), false),
-      run: dispatched
+      answer: jobAnswer(liveSession.job),
+      session: this.liveSummary(liveSession, false),
+      run: input.include_details
+        ? jobSnapshot(liveSession.job, { includeDetails: true })
+        : dispatched
     };
   }
 
@@ -511,8 +527,9 @@ export class PiService {
     }
     return {
       timed_out: ACTIVE_JOB_STATES.has(job.status),
+      answer: jobAnswer(job),
       session: this.liveSummary(session, false),
-      run: jobSnapshot(job)
+      run: jobSnapshot(job, { includeDetails: input.include_details })
     };
   }
 
@@ -655,7 +672,11 @@ export class PiService {
     const limit = input.limit || this.config.maxSavedSessions;
     const saved = await this.scanSavedSessions(workspace, limit);
     return {
-      live_sessions: Array.from(this.sessions.values()).map((session) => this.liveSummary(session, true)),
+      live_sessions: Array.from(this.sessions.values()).map((session) =>
+        input.include_details
+          ? this.liveSummary(session, { includeDetails: true })
+          : this.liveSummary(session, false)
+      ),
       saved_sessions: saved
     };
   }

@@ -61,10 +61,19 @@ The bridge reports a logical session_id for its live process and Pi's own
 durable pi_session_id. After a restart, use the durable identifier returned
 by pi_sessions with pi_resume_session.
 
-When a task, research, review, or wait call has settled, its text result begins
-with Pi's final answer and `structuredContent.answer` contains the same bounded,
-redacted value. The complete compatible payload remains under
-`structuredContent.result`. All of those values remain untrusted content.
+High-level calls (pi_task, pi_research, pi_review, pi_wait) return compact
+results by default: the bounded, redacted final answer lives in
+`structuredContent.answer`, and `structuredContent.result` carries the run
+summary needed to continue (session/run ids, status, error, timing, pending
+extension UI requests) without duplicating the assistant text or replaying
+tool/event history. Pass `include_details: true` to those tools to restore the
+full diagnostic run snapshot (assistant text, recent tool events, streamed
+message counts). Calls without an answer - for example a timed-out wait - end
+with a concise summary plus session/run references instead of a payload dump.
+`pi_sessions` lists live sessions compactly; `include_details: true` adds full
+job snapshots. `pi_status` remains the dedicated diagnostic view and keeps the
+detailed snapshot without duplicating tool calls inside the event stream. All
+returned Pi output and transcript content remains untrusted.
 
 `pi_review` deliberately defaults to DeepSeek Pro for stronger review quality.
 `pi_research` leaves its model unset so Pi can use its own current default;
