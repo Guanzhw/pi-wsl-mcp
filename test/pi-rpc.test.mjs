@@ -65,6 +65,19 @@ test("PiRpcProcess treats non-JSON stdout as a bounded protocol warning", () => 
   assert.match(rpc.protocolWarnings[0], /Non-JSON output/);
 });
 
+test("PiRpcProcess bounds an unterminated stderr line", () => {
+  const rpc = new PiRpcProcess({
+    piBin: "/tmp/pi",
+    cwd: "/tmp",
+    profile: { id: "workspace", tools: null },
+    startupTimeoutMs: 1000,
+    commandTimeoutMs: 1000
+  });
+  rpc.consumeStderr("x".repeat(1024 * 1024 + 100));
+  assert.equal(rpc.stderrBuffer.length, 1024 * 1024);
+  assert.match(rpc.protocolWarnings.at(-1), /stderr line exceeded 1 MiB/);
+});
+
 test("PiRpcProcess waits for an extension UI response to reach stdin", async () => {
   const stdin = new PassThrough();
   let line = "";

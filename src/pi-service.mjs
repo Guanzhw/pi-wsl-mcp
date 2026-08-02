@@ -15,7 +15,21 @@ import {
 import { PiRpcProcess } from "./pi-rpc.mjs";
 
 const ACTIVE_JOB_STATES = new Set(["accepted", "running", "collecting", "cancelling"]);
+const TERMINAL_JOB_STATES = new Set(["settled", "error"]);
 const INTERACTIVE_UI_METHODS = new Set(["select", "confirm", "input", "editor"]);
+// Pi RPC mode emits fire-and-forget extension notifications (setStatus, notify,
+// setWidget) as extension_ui_request events with these non-interactive methods.
+// They are summarized into the bounded event stream but never stored as pending
+// requests and must never mutate run/model/cleanup state: a late status
+// notification cannot reopen or block a completed run.
+const NOTIFICATION_UI_METHODS = new Set(["setStatus", "notify", "setWidget"]);
+// Small, monotonic lifecycle enums (idle -> running -> stopped -> failed and
+// pending -> running -> completed/failed). Model stop (agent_end) is NOT run
+// settlement; only agent_settled plus final collection settles the run.
+const MODEL_STATUS = new Set(["idle", "running", "stopped", "failed"]);
+const CLEANUP_STATUS = new Set(["pending", "running", "completed", "failed"]);
+const MAX_MODEL_BUCKETS = 8;
+const OTHER_MODEL_BUCKET = "__other__";
 
 export const PROFILES = {
   workspace: {
@@ -151,11 +165,158 @@ function summarizeEntry(entry, includeContent) {
   return boundedValue(summary, { maxString: 1000 });
 }
 
+// Bounded, safe target for the latest tool execution: a path/file argument when
+// the tool call carried one. Never the tool result payload.
+function toolTarget(args) {
+  if (!args || typeof args !== "object") {
+    return null;
+  }
+  const candidate = typeof args.path === "string"
+    ? args.path
+    : typeof args.file === "string"
+      ? args.file
+      : null;
+  if (!candidate) {
+    return null;
+  }
+  const bounded = boundedValue(candidate, { maxString: 300 });
+  return typeof bounded === "string" && bounded.trim() ? bounded : null;
+}
+
+// Compact run progress: a coarse phase derived from the run state machine,
+// the timestamp of the latest observed activity, and the latest tool's
+// name/status plus a safe target (path/file) when known. No ETA is invented.
+export function runProgress(job) {
+  if (!job) {
+    return null;
+  }
+  const lastEvent = job.events?.length ? job.events[job.events.length - 1] : null;
+  let lastActivityAt = null;
+  for (const candidate of [lastEvent?.at, job.lastTool?.at, job.settledAt, job.startedAt]) {
+    if (!candidate) {
+      continue;
+    }
+    if (lastActivityAt === null || Date.parse(candidate) > Date.parse(lastActivityAt)) {
+      lastActivityAt = candidate;
+    }
+  }
+  const progress = {
+    phase: phaseFor(job),
+    last_activity_at: lastActivityAt
+  };
+  const tool = job.lastTool;
+  if (tool && typeof tool.name === "string") {
+    const latest = { name: tool.name, status: tool.status };
+    if (tool.target) {
+      latest.target = tool.target;
+    }
+    progress.latest_tool = latest;
+  }
+  return progress;
+}
+
+// Compact progress phase derived from the run state machine. Phases explicitly
+// distinguish model work (model_working/model_awaiting_input), extension cleanup
+// and final collection (cleanup, reached while collecting or once the model
+// stopped), and settlement. latest_tool information is preserved separately.
+function phaseFor(job) {
+  switch (job.status) {
+    case "accepted":
+      return "starting";
+    case "running":
+      return job.modelStatus === "stopped"
+        ? "cleanup"
+        : job.uiRequests && job.uiRequests.size > 0
+          ? "model_awaiting_input"
+          : "model_working";
+    case "collecting":
+      return "cleanup";
+    case "cancelling":
+      return "cancelling";
+    case "settled":
+      return "settled";
+    case "error":
+      return "error";
+    default:
+      return String(job.status);
+  }
+}
+
+function usageNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+// Extract real, billed assistant usage from a Pi message_end message. Synthetic
+// failure/abort messages carry an all-zero usage object and are not model
+// calls, so they are filtered out here.
+export function usageFromMessage(message) {
+  if (!message || message.role !== "assistant" || !message.usage || typeof message.usage !== "object") {
+    return null;
+  }
+  const usage = message.usage;
+  const input = usageNumber(usage.input);
+  const output = usageNumber(usage.output);
+  const cacheRead = usageNumber(usage.cacheRead);
+  const cacheWrite = usageNumber(usage.cacheWrite);
+  const reasoning = usageNumber(usage.reasoning);
+  // Pi reports reasoning as a subset of output, so do not add it again when
+  // reconstructing a missing provider total.
+  const total = usageNumber(usage.totalTokens) || input + output + cacheRead + cacheWrite;
+  const cost = usageNumber(usage.cost?.total);
+  if (total <= 0 && cost <= 0) {
+    return null;
+  }
+  return { input, output, cacheRead, cacheWrite, reasoning, total, cost };
+}
+
+// Compact run statistics aggregated from assistant message_end events exactly
+// once per completed assistant message. turn_end and other events never
+// contribute. The provider/model breakdown is bounded.
+export function runStats(job) {
+  if (!job) {
+    return null;
+  }
+  const tokens = job.stats?.tokens || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
+  let elapsedMs = 0;
+  if (typeof job.startedAt === "string") {
+    const endedAt = typeof job.settledAt === "string" ? Date.parse(job.settledAt) : Date.now();
+    const diff = endedAt - Date.parse(job.startedAt);
+    if (Number.isFinite(diff) && diff >= 0) {
+      elapsedMs = diff;
+    }
+  }
+  const models = Array.from(job.stats?.models?.values() || [])
+    .map(({ key, provider, model, model_calls, tokens: bucketTokens, cost }) => ({
+      provider: key === OTHER_MODEL_BUCKET ? "other" : provider,
+      model: key === OTHER_MODEL_BUCKET ? null : model,
+      model_calls,
+      usage_total: bucketTokens,
+      cost
+    }))
+    .sort((left, right) => right.cost - left.cost || right.usage_total - left.usage_total)
+    .slice(0, MAX_MODEL_BUCKETS);
+  return {
+    elapsed_ms: elapsedMs,
+    model_calls: job.stats?.modelCalls || 0,
+    usage: {
+      input: tokens.input,
+      output: tokens.output,
+      cache_read: tokens.cacheRead,
+      cache_write: tokens.cacheWrite,
+      reasoning: tokens.reasoning,
+      total: tokens.total
+    },
+    cost: job.stats?.cost || 0,
+    models
+  };
+}
+
 // Compact-by-default run snapshot. The compact form keeps everything needed to
-// continue (ids, status, timing, errors, pending UI requests) without the
-// diagnostic payload; includeDetails restores the full snapshot. tool_calls is
-// intentionally omitted from the detailed form because it is fully redundant
-// with the bounded recent_events stream (tool_execution_start/end summaries).
+// continue (ids, status, timing, errors, bounded progress, compact usage
+// statistics, pending UI requests) without the diagnostic payload;
+// includeDetails restores the full snapshot. tool_calls is intentionally
+// omitted from the detailed form because it is fully redundant with the
+// bounded recent_events stream (tool_execution_start/end summaries).
 export function jobSnapshot(job, options = {}) {
   if (!job) {
     return null;
@@ -163,13 +324,27 @@ export function jobSnapshot(job, options = {}) {
   const includeDetails = Boolean(options.includeDetails);
   const output = {
     run_id: job.id,
+    // run status is kept explicit next to the session-level process_status,
+    // and model/cleanup lifecycle are tracked separately from run settlement.
     status: job.status,
+    model_status: job.modelStatus && MODEL_STATUS.has(job.modelStatus) ? job.modelStatus : "idle",
+    cleanup_status: job.cleanupStatus && CLEANUP_STATUS.has(job.cleanupStatus) ? job.cleanupStatus : "pending",
     started_at: job.startedAt,
     settled_at: job.settledAt || null,
     prompt_kind: job.kind,
     error: job.error || null,
-    pending_ui_requests: Array.from(job.uiRequests.values())
+    pending_ui_requests: Array.from(job.uiRequests.values()),
+    progress: runProgress(job),
+    stats: runStats(job)
   };
+  if (job.budget) {
+    output.budget = {
+      max_elapsed_seconds: job.budget.maxElapsedSeconds,
+      max_model_calls: job.budget.maxModelCalls,
+      max_cost: job.budget.maxCost
+    };
+    output.budget_exceeded = job.budget.exceeded || null;
+  }
   if (includeDetails) {
     output.result = job.result || null;
     output.streamed_message_updates = job.messageUpdates;
@@ -178,9 +353,193 @@ export function jobSnapshot(job, options = {}) {
   return output;
 }
 
+// Minimal pi_sessions directory entry for a live session. The directory form
+// carries only what is needed to pick a session or a run: identity, explicit
+// process_status plus the legacy lifecycle alias, workspace, profile,
+// timestamps, the active run id/status, and the count of pending extension UI
+// requests. Diagnostics (model, thinking level, streaming state, protocol
+// warnings, full pending UI requests, session file, job snapshot) stay in
+// liveSummary for include_details=true and pi_status.
+export function liveDirectoryEntry(session) {
+  const activeJob = session.job && ACTIVE_JOB_STATES.has(session.job.status)
+    ? session.job
+    : null;
+  return {
+    session_id: session.id,
+    lifecycle: session.lifecycle,
+    process_status: session.lifecycle,
+    workspace: session.workspace,
+    profile: session.profile.id,
+    created_at: session.createdAt,
+    pi_session_id: session.state?.sessionId || null,
+    pi_session_name: session.state?.sessionName || null,
+    active_run: activeJob ? { run_id: activeJob.id, status: activeJob.status } : null,
+    pending_ui_request_count: session.uiRequests.size
+  };
+}
+
+// Minimal pi_sessions directory entry for a saved Pi session. The session file
+// path is never exposed; byte size is diagnostic and returned only when
+// includeDetails is set.
+export function savedDirectoryEntry(saved, includeDetails = false) {
+  const entry = {
+    pi_session_id: saved.pi_session_id,
+    workspace: saved.workspace,
+    created_at: saved.created_at,
+    modified_at: saved.modified_at
+  };
+  if (includeDetails && typeof saved.bytes === "number") {
+    entry.bytes = saved.bytes;
+  }
+  return entry;
+}
+
+// Directly reusable pi_wait/pi_status arguments for continuation after any
+// accepted operation or timeout. Always carries session_id; run_id is included
+// when a run exists.
+function continuationFor(sessionId, runId) {
+  return {
+    pi_wait: runId ? { session_id: sessionId, run_id: runId } : { session_id: sessionId },
+    pi_status: { session_id: sessionId }
+  };
+}
+
 function jobAnswer(job) {
   const answer = job?.result?.assistant_text;
   return typeof answer === "string" && answer.trim() ? answer : null;
+}
+
+// Backward-compatible optional run budgets on high-level tools. Each limit is
+// validated positive and bounded; budgets are never defaulted on. A nested
+// budget object with the same meanings is also accepted.
+function parseBudget(input) {
+  const source = input?.budget && typeof input.budget === "object" && !Array.isArray(input.budget)
+    ? {
+      max_elapsed_seconds: input.max_elapsed_seconds ?? input.budget.max_elapsed_seconds,
+      max_model_calls: input.max_model_calls ?? input.budget.max_model_calls,
+      max_cost: input.max_cost ?? input.budget.max_cost
+    }
+    : input || {};
+  const limits = [
+    ["max_elapsed_seconds", "maxElapsedSeconds", 86400, false],
+    ["max_model_calls", "maxModelCalls", 1000000, true],
+    ["max_cost", "maxCost", 10000, false]
+  ];
+  const budget = { maxElapsedSeconds: null, maxModelCalls: null, maxCost: null };
+  let present = false;
+  for (const [key, field, maximum, integerOnly] of limits) {
+    const value = source[key];
+    if (value === undefined || value === null) {
+      continue;
+    }
+    const number = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(number) || number <= 0 || number > maximum || (integerOnly && !Number.isInteger(number))) {
+      throw new PiLocalError(
+        "invalid_budget",
+        key + " must be a positive " + (integerOnly ? "integer" : "number") + " bounded by " + maximum + "."
+      );
+    }
+    budget[field] = number;
+    present = true;
+  }
+  return present ? budget : null;
+}
+
+// Which budget limit has fired for this run, if any. Fires at most once per
+// run: cancelRequested latches after the first exceeded limit.
+function budgetLimitFired(job) {
+  if (!job?.budget || job.budget.cancelRequested) {
+    return null;
+  }
+  if (job.budget.maxElapsedSeconds !== null && typeof job.startedAt === "string") {
+    const elapsedSeconds = (Date.now() - Date.parse(job.startedAt)) / 1000;
+    if (Number.isFinite(elapsedSeconds) && elapsedSeconds >= job.budget.maxElapsedSeconds) {
+      return "elapsed";
+    }
+  }
+  if (job.budget.maxModelCalls !== null && (job.stats?.modelCalls || 0) >= job.budget.maxModelCalls) {
+    return "model_calls";
+  }
+  if (job.budget.maxCost !== null && (job.stats?.cost || 0) >= job.budget.maxCost) {
+    return "cost";
+  }
+  return null;
+}
+
+function clearBudgetTimer(job) {
+  if (job?.budgetTimer) {
+    clearTimeout(job.budgetTimer);
+    job.budgetTimer = null;
+  }
+}
+
+function scheduleElapsedBudget(session, job) {
+  if (job?.budget?.maxElapsedSeconds === null || job?.budget?.maxElapsedSeconds === undefined) {
+    return;
+  }
+  const delayMs = Math.max(1, Math.ceil(job.budget.maxElapsedSeconds * 1000));
+  job.budgetTimer = setTimeout(() => {
+    job.budgetTimer = null;
+    if (session.job === job) {
+      checkRunBudget(session);
+    }
+  }, delayMs);
+  job.budgetTimer.unref?.();
+}
+
+// Convergence guard for optional run budgets. When a limit is exceeded while
+// the run is still active, request cancellation exactly once, report which
+// limit fired, and move the run to cancelling. Pi then settles it through the
+// normal agent_settled -> collection path; no further cancels are issued even
+// if the run keeps producing events before it settles.
+function checkRunBudget(session) {
+  const job = session?.job;
+  if (!job || !ACTIVE_JOB_STATES.has(job.status)) {
+    return;
+  }
+  const limit = budgetLimitFired(job);
+  if (!limit) {
+    return;
+  }
+  job.budget.exceeded = limit;
+  job.budget.cancelRequested = true;
+  job.status = "cancelling";
+  clearBudgetTimer(job);
+  job.events.push({ type: "budget_exceeded", limit, at: now() });
+  void (session.rpc?.command?.({ type: "abort" }) || Promise.resolve()).catch(() => {});
+}
+
+// Resolve a live session for high-level task reuse. Start-only options
+// (workspace/provider/model/thinking/name) are rejected rather than silently
+// changing the live session, and the live profile must match the profile the
+// calling tool is expected to enforce. A closed/faulted process cannot be
+// reused.
+function resolveReuseTarget(input, expectedProfile, getSession) {
+  for (const key of ["workspace", "provider", "model", "thinking", "name"]) {
+    if (input[key] !== undefined && input[key] !== null && String(input[key]).trim() !== "") {
+      throw new PiLocalError(
+        "reuse_conflict",
+        "session_id cannot be combined with " + key + "; reusing a session keeps the live session's own " + key + "."
+      );
+    }
+  }
+  const session = getSession(input.session_id);
+  if (session.lifecycle !== "running") {
+    throw new PiLocalError("pi_not_running", "This Pi session is " + session.lifecycle + " and cannot be reused.");
+  }
+  if (session.profile.id !== expectedProfile.id) {
+    throw new PiLocalError(
+      "profile_mismatch",
+      "Session " + session.id + " runs the " + session.profile.id + " profile, but this tool requires the " + expectedProfile.id + " profile."
+    );
+  }
+  if (session.job && ACTIVE_JOB_STATES.has(session.job.status)) {
+    throw new PiLocalError(
+      "pi_busy",
+      "Session " + session.id + " still has active run " + session.job.id + "; wait for it to settle before reusing the session."
+    );
+  }
+  return session;
 }
 
 function activeProcessCount(sessions) {
@@ -247,9 +606,11 @@ export class PiService {
   }
 
   liveSummary(session, jobOptions = null) {
+    const runTerminal = Boolean(session.job && TERMINAL_JOB_STATES.has(session.job.status));
     const result = {
       session_id: session.id,
       lifecycle: session.lifecycle,
+      process_status: session.lifecycle,
       workspace: session.workspace,
       profile: session.profile.id,
       created_at: session.createdAt,
@@ -260,7 +621,12 @@ export class PiService {
         ? { provider: session.state.model.provider, id: session.state.model.id }
         : null,
       thinking_level: session.state?.thinkingLevel || null,
-      is_streaming: Boolean(session.state?.isStreaming),
+      // Once the active run is terminal, is_streaming is false even if Pi's
+      // own state is stale. The session process may keep running; that is a
+      // separate axis (process_status/lifecycle).
+      is_streaming: runTerminal ? false : Boolean(session.state?.isStreaming),
+      model_status: session.job && MODEL_STATUS.has(session.job.modelStatus) ? session.job.modelStatus : null,
+      cleanup_status: session.job && CLEANUP_STATUS.has(session.job.cleanupStatus) ? session.job.cleanupStatus : null,
       protocol_warnings: session.rpc.protocolWarnings.slice(-5),
       pending_ui_requests: Array.from(session.uiRequests.values())
     };
@@ -283,14 +649,35 @@ export class PiService {
     session.rpc.on("failure", (error) => {
       session.lifecycle = "faulted";
       if (session.job && ACTIVE_JOB_STATES.has(session.job.status)) {
+        clearBudgetTimer(session.job);
         session.job.status = "error";
+        if (session.job.modelStatus === "running") {
+          session.job.modelStatus = "failed";
+        }
+        if (session.job.cleanupStatus !== "completed") {
+          session.job.cleanupStatus = "failed";
+        }
         session.job.error = error.message;
         session.job.settledAt = now();
+        void this.autoCloseIfSettled(session);
       }
     });
     session.rpc.on("exit", () => {
       if (session.lifecycle === "running") {
         session.lifecycle = "closed";
+      }
+      if (session.job && ACTIVE_JOB_STATES.has(session.job.status)) {
+        clearBudgetTimer(session.job);
+        session.job.status = "error";
+        if (session.job.modelStatus === "running") {
+          session.job.modelStatus = "failed";
+        }
+        if (session.job.cleanupStatus !== "completed") {
+          session.job.cleanupStatus = "failed";
+        }
+        session.job.error ||= "Pi process exited before the run settled.";
+        session.job.settledAt = now();
+        void this.autoCloseIfSettled(session);
       }
     });
   }
@@ -320,14 +707,29 @@ export class PiService {
           if (job.toolCalls.length > 60) {
             job.toolCalls.shift();
           }
+          job.lastTool = {
+            name: event.toolName,
+            status: "running",
+            at: summary.at,
+            target: toolTarget(event.args)
+          };
+        } else if (event?.type === "tool_execution_end") {
+          const status = event.isError ? "failed" : "completed";
+          if (job.lastTool && job.lastTool.name === event.toolName) {
+            job.lastTool.status = status;
+            job.lastTool.at = summary.at;
+          } else {
+            job.lastTool = { name: event.toolName, status, at: summary.at, target: null };
+          }
+        } else if (event?.type === "message_end") {
+          this.aggregateMessageUsage(job, event.message);
         }
       }
       if (job.events.length > 120) {
         job.events.shift();
       }
     }
-    if (
-      event?.type === "extension_ui_request" &&
+    if (event?.type === "extension_ui_request" &&
       typeof event.id === "string" &&
       INTERACTIVE_UI_METHODS.has(event.method)
     ) {
@@ -345,15 +747,30 @@ export class PiService {
       if (job) {
         job.uiRequests.set(event.id, session.uiRequests.get(event.id));
       }
+    } else if (event?.type === "extension_ui_request" && NOTIFICATION_UI_METHODS.has(event.method)) {
+      // Non-interactive status notifications (setStatus/notify/setWidget):
+      // fire-and-forget. They never become pending requests and never mutate
+      // run/model/cleanup state, so a late notification cannot keep a
+      // completed model or run active or reset terminal state.
     }
     if (event?.type === "agent_start" && job && ACTIVE_JOB_STATES.has(job.status)) {
       job.status = "running";
+      job.modelStatus = "running";
+    }
+    if (event?.type === "agent_end" && job && ACTIVE_JOB_STATES.has(job.status)) {
+      // The model stopped (agent_end may carry willRetry, so a later
+      // agent_start legitimately resumes it). This is NOT settlement: the run
+      // stays active until agent_settled and final collection complete.
+      job.modelStatus = "stopped";
     }
     if (event?.type === "agent_settled" && job && ACTIVE_JOB_STATES.has(job.status)) {
+      clearBudgetTimer(job);
       job.status = "collecting";
+      job.cleanupStatus = "running";
       job.settledAt = now();
       void this.collectFinalResult(session, job);
     }
+    checkRunBudget(session);
   }
 
   async collectFinalResult(session, job) {
@@ -366,13 +783,16 @@ export class PiService {
         assistant_text: response?.data?.text ?? null
       };
       job.status = "settled";
+      job.cleanupStatus = "completed";
     } catch (error) {
       if (session.job !== job) {
         return;
       }
       job.status = "error";
+      job.cleanupStatus = "failed";
       job.error = error instanceof Error ? error.message : String(error);
     }
+    this.autoCloseIfSettled(session);
   }
 
   async startSession(input = {}) {
@@ -436,28 +856,120 @@ export class PiService {
     }
   }
 
+  // Aggregate real assistant message_end usage into the job's compact stats
+  // exactly once per completed, billed assistant message. turn_end and every
+  // other event type never contribute, so there is no double counting.
+  aggregateMessageUsage(job, message) {
+    const usage = usageFromMessage(message);
+    if (!usage) {
+      return;
+    }
+    job.stats.modelCalls += 1;
+    job.stats.tokens.input += usage.input;
+    job.stats.tokens.output += usage.output;
+    job.stats.tokens.cacheRead += usage.cacheRead;
+    job.stats.tokens.cacheWrite += usage.cacheWrite;
+    job.stats.tokens.reasoning += usage.reasoning;
+    job.stats.tokens.total += usage.total;
+    job.stats.cost += usage.cost;
+    const provider = typeof message.provider === "string" && message.provider
+      ? message.provider
+      : "unknown";
+    const model = typeof message.responseModel === "string" && message.responseModel
+      ? message.responseModel
+      : typeof message.model === "string" && message.model
+        ? message.model
+        : "unknown";
+    let key = provider + "/" + model;
+    let bucket = job.stats.models.get(key);
+    if (!bucket) {
+      const namedBucketLimit = MAX_MODEL_BUCKETS - 1;
+      if (job.stats.models.size >= namedBucketLimit) {
+        key = OTHER_MODEL_BUCKET;
+        bucket = job.stats.models.get(key);
+      }
+      if (!bucket) {
+        bucket = {
+          key,
+          provider: key === OTHER_MODEL_BUCKET ? "other" : provider,
+          model: key === OTHER_MODEL_BUCKET ? null : model,
+          model_calls: 0,
+          tokens: 0,
+          cost: 0
+        };
+        job.stats.models.set(key, bucket);
+      }
+    }
+    bucket.model_calls += 1;
+    bucket.tokens += usage.total;
+    bucket.cost += usage.cost;
+  }
+
+  // Close the live process once its run reaches a terminal state, when an
+  // auto-close was requested for that run. Returns the close promise (or null
+  // when nothing should close) so callers can await the process teardown; the
+  // promise is also stored on the session so a racing wait() can join it
+  // without closing twice.
+  autoCloseIfSettled(session) {
+    if (!session.autoCloseJobId) {
+      return null;
+    }
+    const job = session.job;
+    if (!job || job.id !== session.autoCloseJobId || !TERMINAL_JOB_STATES.has(job.status)) {
+      return null;
+    }
+    session.autoCloseJobId = null;
+    session.pendingClose = this.close({ session_id: session.id }).catch(() => null);
+    return session.pendingClose;
+  }
+
   async task(input) {
-    const session = await this.startSession(input);
-    const dispatched = await this.send({
-      session_id: session.session_id,
-      message: input.message,
-      behavior: "prompt"
-    });
+    const expectedProfile = profileFor(input.profile || "workspace");
+    const session = input.session_id
+      ? resolveReuseTarget(input, expectedProfile, (id) => this.getSession(id))
+      : this.getSession((await this.startSession(input)).session_id);
+    let dispatched;
+    try {
+      dispatched = await this.send({
+        session_id: session.id,
+        message: input.message,
+        behavior: "prompt",
+        max_elapsed_seconds: input.max_elapsed_seconds,
+        max_model_calls: input.max_model_calls,
+        max_cost: input.max_cost,
+        budget: input.budget
+      });
+    } catch (error) {
+      if (input.auto_close) {
+        session.autoCloseJobId = session.job?.id ?? null;
+        await this.autoCloseIfSettled(session);
+      }
+      throw error;
+    }
+    if (input.auto_close) {
+      session.autoCloseJobId = session.job?.id ?? null;
+      await this.autoCloseIfSettled(session);
+    }
     if (input.wait_seconds && input.wait_seconds > 0) {
       return this.wait({
-        session_id: session.session_id,
+        session_id: session.id,
         run_id: dispatched.run_id,
         timeout_seconds: input.wait_seconds,
-        include_details: input.include_details
+        include_details: input.include_details,
+        auto_close: input.auto_close
       });
     }
-    const liveSession = this.getSession(session.session_id);
+    const job = session.job;
+    const runId = job ? job.id : dispatched.run_id;
     return {
-      answer: jobAnswer(liveSession.job),
-      session: this.liveSummary(liveSession, false),
+      answer: jobAnswer(job),
+      session_id: session.id,
+      run_id: runId,
+      session: this.liveSummary(session, false),
       run: input.include_details
-        ? jobSnapshot(liveSession.job, { includeDetails: true })
-        : dispatched
+        ? jobSnapshot(job, { includeDetails: true })
+        : dispatched,
+      continuation: continuationFor(session.id, runId)
     };
   }
 
@@ -475,31 +987,68 @@ export class PiService {
           "Pi is still working. Use behavior=steer or behavior=follow_up, or wait for run " + existing.id + "."
         );
       }
+      session.autoCloseJobId = null;
+      session.pendingClose = null;
       const job = {
         id: createId("run"),
         status: "accepted",
         kind: "prompt",
+        modelStatus: "idle",
+        cleanupStatus: "pending",
+        budget: parseBudget(input),
         startedAt: now(),
         settledAt: null,
         events: [],
         uiRequests: new Map(),
         toolCalls: [],
+        lastTool: null,
         messageUpdates: 0,
         result: null,
-        error: null
+        error: null,
+        stats: {
+          modelCalls: 0,
+          tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
+          cost: 0,
+          models: new Map()
+        }
       };
       session.job = job;
+      scheduleElapsedBudget(session, job);
       try {
         await session.rpc.command({ type: "prompt", message: input.message });
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         if (session.job === job) {
+          clearBudgetTimer(job);
           job.status = "error";
-          job.error = error instanceof Error ? error.message : String(error);
+          job.cleanupStatus = "failed";
+          job.error = message;
           job.settledAt = now();
         }
-        throw error;
+        const code = error instanceof PiLocalError ? error.code : "prompt_failed";
+        const priorDetails = error instanceof PiLocalError &&
+          error.details &&
+          typeof error.details === "object" &&
+          !Array.isArray(error.details)
+          ? error.details
+          : {};
+        throw new PiLocalError(code, message, {
+          ...priorDetails,
+          accepted_result: {
+            answer: null,
+            session_id: session.id,
+            run_id: job.id,
+            session: this.liveSummary(session, false),
+            run: jobSnapshot(job),
+            continuation: continuationFor(session.id, job.id)
+          }
+        });
       }
-      return jobSnapshot(job);
+      return {
+        session_id: session.id,
+        ...jobSnapshot(job),
+        continuation: continuationFor(session.id, job.id)
+      };
     }
 
     if (!existing || !ACTIVE_JOB_STATES.has(existing.status)) {
@@ -511,7 +1060,11 @@ export class PiService {
     }
     await session.rpc.command({ type: command, message: input.message });
     existing.events.push({ type: command + "_accepted", at: now() });
-    return jobSnapshot(existing);
+    return {
+      session_id: session.id,
+      ...jobSnapshot(existing),
+      continuation: continuationFor(session.id, existing.id)
+    };
   }
 
   async wait(input) {
@@ -520,17 +1073,46 @@ export class PiService {
     if (!job || (input.run_id && input.run_id !== job.id)) {
       throw new PiLocalError("unknown_run", "No matching current run exists for this Pi session.");
     }
-    const timeoutMs = Math.max(0, Math.min((input.timeout_seconds ?? 120) * 1000, 300000));
+    const maxWaitSeconds = this.config?.maxWaitSeconds ?? 285;
+    const requestedSeconds = input.timeout_seconds ?? 120;
+    const effectiveSeconds = Math.max(0, Math.min(requestedSeconds, maxWaitSeconds));
+    const clamped = requestedSeconds > effectiveSeconds;
+    const timeoutMs = effectiveSeconds * 1000;
     const deadline = Date.now() + timeoutMs;
     while (ACTIVE_JOB_STATES.has(job.status) && Date.now() < deadline) {
+      checkRunBudget(session);
       await sleep(Math.min(350, Math.max(25, deadline - Date.now())));
     }
-    return {
+    if (input.auto_close && TERMINAL_JOB_STATES.has(job.status)) {
+      // Join the close already triggered by autoCloseIfSettled (either just
+      // now, or deferred from an earlier timeout) instead of closing twice.
+      const pending = this.autoCloseIfSettled(session) || session.pendingClose || null;
+      if (pending) {
+        try {
+          await pending;
+        } catch (error) {
+          // A racing deferred auto-close may already be tearing the process down.
+        }
+      }
+    }
+    const result = {
       timed_out: ACTIVE_JOB_STATES.has(job.status),
+      session_id: session.id,
+      run_id: job.id,
       answer: jobAnswer(job),
       session: this.liveSummary(session, false),
-      run: jobSnapshot(job, { includeDetails: input.include_details })
+      run: jobSnapshot(job, { includeDetails: input.include_details }),
+      continuation: continuationFor(session.id, job.id)
     };
+    if (clamped) {
+      result.wait = {
+        requested_seconds: requestedSeconds,
+        effective_seconds: effectiveSeconds,
+        clamped: true,
+        max_seconds: maxWaitSeconds
+      };
+    }
+    return result;
   }
 
   async status(input) {
@@ -553,9 +1135,14 @@ export class PiService {
       throw new PiLocalError("no_active_run", "No active Pi run can be cancelled.");
     }
     await session.rpc.command({ type: "abort" });
+    clearBudgetTimer(job);
     job.status = "cancelling";
     job.events.push({ type: "abort_acknowledged", at: now() });
-    return jobSnapshot(job);
+    return {
+      session_id: session.id,
+      ...jobSnapshot(job),
+      continuation: continuationFor(session.id, job.id)
+    };
   }
 
   async respondToUi(input) {
@@ -675,9 +1262,9 @@ export class PiService {
       live_sessions: Array.from(this.sessions.values()).map((session) =>
         input.include_details
           ? this.liveSummary(session, { includeDetails: true })
-          : this.liveSummary(session, false)
+          : liveDirectoryEntry(session)
       ),
-      saved_sessions: saved
+      saved_sessions: saved.map((entry) => savedDirectoryEntry(entry, input.include_details))
     };
   }
 

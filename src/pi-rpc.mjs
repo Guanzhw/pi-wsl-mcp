@@ -115,6 +115,10 @@ export class PiRpcProcess extends EventEmitter {
     while (true) {
       const newline = this.stderrBuffer.indexOf("\n");
       if (newline === -1) {
+        if (this.stderrBuffer.length > 1024 * 1024) {
+          this.stderrBuffer = this.stderrBuffer.slice(-1024 * 1024);
+          this.protocolWarning("Pi RPC stderr line exceeded 1 MiB; discarded leading bytes.");
+        }
         return;
       }
       const line = redactText(this.stderrBuffer.slice(0, newline).replace(/\r$/, ""));
