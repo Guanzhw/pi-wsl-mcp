@@ -480,5 +480,5 @@ closes live bridge sessions while preserving Pi's durable transcripts.
   and EOL-guard tests.
 - The package is public-ready (`pi-wsl-mcp`, `pi-wsl-mcp` bin, `files`
   allowlist, no `private` flag) but is intentionally not published; install
-  from the checkout with `npm install -g .` when needed. No license is
-  claimed: add one before publishing.
+  from the checkout with `npm install -g .` when needed. It is licensed under
+  the [MIT License](LICENSE).

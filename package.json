@@ -2,6 +2,7 @@
   "name": "pi-wsl-mcp",
   "version": "0.1.0",
   "description": "An MCP bridge for the Pi coding agent running in WSL.",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "pi-wsl-mcp": "src/cli.mjs"
