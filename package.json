@@ -1,15 +1,23 @@
 {
-  "name": "pi-local-mcp",
+  "name": "pi-wsl-mcp",
   "version": "0.1.0",
-  "private": true,
-  "description": "A user-level MCP bridge for the Pi coding agent running in WSL.",
+  "description": "An MCP bridge for the Pi coding agent running in WSL.",
   "type": "module",
+  "bin": {
+    "pi-wsl-mcp": "src/cli.mjs"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "run-pi-wsl-mcp.cmd",
+    "README.md"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
     "start": "node src/cli.mjs",
-    "check": "node --check src/cli.mjs && node --check src/pi-rpc.mjs && node --check src/pi-service.mjs && node --check src/server.mjs && node --check src/util.mjs && node --test",
+    "check": "node --check src/cli.mjs && node --check src/pi-rpc.mjs && node --check src/pi-service.mjs && node --check src/server.mjs && node --check src/util.mjs && node --check src/eol-extension.mjs && node --test",
     "test": "node --test",
     "smoke:mcp": "node scripts/mcp-smoke.mjs"
   },

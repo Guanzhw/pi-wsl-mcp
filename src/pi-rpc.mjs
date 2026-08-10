@@ -1,9 +1,15 @@
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
-import { createId, PiLocalError, redactText } from "./util.mjs";
+import { fileURLToPath } from "node:url";
+import { createId, PiWslError, redactText } from "./util.mjs";
+
+// The bundled, session-scoped line-ending extension loaded into every Pi RPC
+// process (see eol-extension.mjs). Resolved relative to this module so it
+// works from a checkout or an installed package.
+export const EOL_EXTENSION_PATH = fileURLToPath(new URL("./eol-extension.mjs", import.meta.url));
 
 function commandError(response) {
-  return new PiLocalError(
+  return new PiWslError(
     "pi_rpc_error",
     typeof response.error === "string" ? redactText(response.error) : "Pi rejected the RPC command.",
     { command: response.command }
@@ -18,6 +24,16 @@ export function buildPiArgs(options) {
   if (options.profile?.tools?.length) {
     args.push("--tools", options.profile.tools.join(","));
   }
+  // Read-only profiles exclude the function tool named `search`: it collides
+  // with DeepSeek Responses' server-side web_search injection (400
+  // invalid_request_error), and the exclusion applies to built-in, extension,
+  // and custom tools alike.
+  if (options.profile?.excludeTools?.length) {
+    args.push("--exclude-tools", options.profile.excludeTools.join(","));
+  }
+  // Load the bundled EOL guard for this session only; it never touches the
+  // user's global Pi configuration.
+  args.push("--extension", options.extensionPath || EOL_EXTENSION_PATH);
   return args;
 }
 
@@ -57,7 +73,7 @@ export class PiRpcProcess extends EventEmitter {
         windowsHide: true
       });
     } catch (error) {
-      throw new PiLocalError("pi_start_failed", "Could not start Pi: " + redactText(error?.message || String(error)));
+      throw new PiWslError("pi_start_failed", "Could not start Pi: " + redactText(error?.message || String(error)));
     }
 
     const child = this.child;
@@ -67,7 +83,7 @@ export class PiRpcProcess extends EventEmitter {
     child.stderr.on("data", (chunk) => this.consumeStderr(chunk));
     child.on("error", (error) => {
       if (this.child === child) {
-        this.fail(new PiLocalError(
+        this.fail(new PiWslError(
           "pi_process_error",
           "Pi process failed: " + redactText(error?.message || String(error))
         ));
@@ -78,7 +94,7 @@ export class PiRpcProcess extends EventEmitter {
         return;
       }
       if (!this.closed) {
-        this.fail(new PiLocalError(
+        this.fail(new PiWslError(
           "pi_process_exited",
           "Pi process exited" + (code === null ? "" : " with code " + code) + (signal ? " (" + signal + ")" : "."),
           { code, signal, stderr: this.stderrLines.slice(-12) }
@@ -165,14 +181,14 @@ export class PiRpcProcess extends EventEmitter {
 
   command(payload, timeoutMs = this.commandTimeoutMs) {
     if (!this.child || this.closed || !this.child.stdin.writable) {
-      return Promise.reject(new PiLocalError("pi_not_running", "Pi session is not running."));
+      return Promise.reject(new PiWslError("pi_not_running", "Pi session is not running."));
     }
     const id = createId("rpc");
     const command = { ...payload, id };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new PiLocalError(
+        reject(new PiWslError(
           "pi_rpc_timeout",
           "Pi did not acknowledge " + payload.type + " within " + Math.ceil(timeoutMs / 1000) + " seconds."
         ));
@@ -183,20 +199,20 @@ export class PiRpcProcess extends EventEmitter {
           if (error && this.pending.has(id)) {
             this.pending.delete(id);
             clearTimeout(timer);
-            reject(new PiLocalError("pi_write_failed", "Could not send a command to Pi."));
+            reject(new PiWslError("pi_write_failed", "Could not send a command to Pi."));
           }
         });
       } catch (error) {
         this.pending.delete(id);
         clearTimeout(timer);
-        reject(new PiLocalError("pi_write_failed", "Could not send a command to Pi."));
+        reject(new PiWslError("pi_write_failed", "Could not send a command to Pi."));
       }
     });
   }
 
   async respondToUi(payload) {
     if (!this.child || this.closed || !this.child.stdin.writable) {
-      throw new PiLocalError("pi_not_running", "Pi session is not running.");
+      throw new PiWslError("pi_not_running", "Pi session is not running.");
     }
     const permitted = payload?.cancelled === true
       ? { type: "extension_ui_response", id: payload.id, cancelled: true }
@@ -206,7 +222,7 @@ export class PiRpcProcess extends EventEmitter {
           ? { type: "extension_ui_response", id: payload.id, confirmed: payload.confirmed }
           : null;
     if (!permitted || typeof permitted.id !== "string" || !permitted.id) {
-      throw new PiLocalError("invalid_ui_response", "Provide an id and exactly one of value, confirmed, or cancelled.");
+      throw new PiWslError("invalid_ui_response", "Provide an id and exactly one of value, confirmed, or cancelled.");
     }
     await new Promise((resolve, reject) => {
       let settled = false;
@@ -218,7 +234,7 @@ export class PiRpcProcess extends EventEmitter {
         settled = true;
         clearTimeout(timeout);
         if (error) {
-          reject(new PiLocalError("pi_write_failed", "Could not deliver the extension UI response to Pi."));
+          reject(new PiWslError("pi_write_failed", "Could not deliver the extension UI response to Pi."));
         } else {
           resolve();
         }
@@ -248,7 +264,7 @@ export class PiRpcProcess extends EventEmitter {
       return;
     }
     this.closed = true;
-    this.fail(new PiLocalError("pi_session_closed", "Pi session was closed."));
+    this.fail(new PiWslError("pi_session_closed", "Pi session was closed."));
     const child = this.child;
     const exited = new Promise((resolve) => child.once("exit", resolve));
     child.kill("SIGTERM");

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PiService, jobSnapshot, liveDirectoryEntry, savedDirectoryEntry, runProgress, runStats, usageFromMessage } from "../src/pi-service.mjs";
+import { PROFILES, PiService, actionableRunError, jobSnapshot, liveDirectoryEntry, savedDirectoryEntry, runProgress, runStats, usageFromMessage } from "../src/pi-service.mjs";
 
 function activeJob(overrides = {}) {
   return {
@@ -236,7 +236,7 @@ test("terminal runs force is_streaming false while the session process may keep 
   const session = {
     id: "session-1",
     lifecycle: "running",
-    workspace: "/mnt/d/WorkSpace",
+    workspace: "/home/user/work",
     profile: { id: "workspace" },
     createdAt: "2026-08-01T00:00:00.000Z",
     state: { isStreaming: true },
@@ -453,7 +453,7 @@ test("live directory entries are minimal and expose active_run only when a job e
   const busy = {
     id: "session-1",
     lifecycle: "running",
-    workspace: "/mnt/d/WorkSpace/pi-local-mcp",
+    workspace: "/home/user/pi-wsl-mcp",
     profile: { id: "review" },
     createdAt: "2026-08-01T00:00:00.000Z",
     state: { sessionId: "pi-1", sessionName: "Review pass" },
@@ -465,7 +465,7 @@ test("live directory entries are minimal and expose active_run only when a job e
     session_id: "session-1",
     lifecycle: "running",
     process_status: "running",
-    workspace: "/mnt/d/WorkSpace/pi-local-mcp",
+    workspace: "/home/user/pi-wsl-mcp",
     profile: "review",
     created_at: "2026-08-01T00:00:00.000Z",
     pi_session_id: "pi-1",
@@ -484,7 +484,7 @@ test("live directory entries are minimal and expose active_run only when a job e
   const idle = liveDirectoryEntry({
     id: "session-2",
     lifecycle: "starting",
-    workspace: "/mnt/d/WorkSpace",
+    workspace: "/home/user/work",
     profile: { id: "workspace" },
     createdAt: "2026-08-01T00:00:00.000Z",
     state: null,
@@ -503,21 +503,21 @@ test("live directory entries are minimal and expose active_run only when a job e
 test("saved directory entries hide the session file and expose bytes only with details", () => {
   const saved = {
     pi_session_id: "pi-9",
-    workspace: "/mnt/d/WorkSpace",
+    workspace: "/home/user/work",
     created_at: "2026-07-01T00:00:00.000Z",
     modified_at: "2026-07-02T00:00:00.000Z",
     bytes: 1234,
-    session_file: "/home/qq110/.pi/agent/sessions/pi-9.jsonl"
+    session_file: "/home/user/.pi/agent/sessions/pi-9.jsonl"
   };
   assert.deepEqual(savedDirectoryEntry(saved), {
     pi_session_id: "pi-9",
-    workspace: "/mnt/d/WorkSpace",
+    workspace: "/home/user/work",
     created_at: "2026-07-01T00:00:00.000Z",
     modified_at: "2026-07-02T00:00:00.000Z"
   });
   assert.deepEqual(savedDirectoryEntry(saved, true), {
     pi_session_id: "pi-9",
-    workspace: "/mnt/d/WorkSpace",
+    workspace: "/home/user/work",
     created_at: "2026-07-01T00:00:00.000Z",
     modified_at: "2026-07-02T00:00:00.000Z",
     bytes: 1234
@@ -530,7 +530,7 @@ test("session listing is a minimal directory unless details are requested", asyn
   const session = {
     id: "session-1",
     lifecycle: "running",
-    workspace: "/mnt/d/WorkSpace/pi-local-mcp",
+    workspace: "/home/user/pi-wsl-mcp",
     profile: { id: "review" },
     createdAt: "2026-08-01T00:00:00.000Z",
     state: { sessionId: "pi-1", sessionName: "Review pass" },
@@ -543,7 +543,7 @@ test("session listing is a minimal directory unless details are requested", asyn
     config: { maxSavedSessions: 100 },
     scanSavedSessions: async () => [{
       pi_session_id: "pi-9",
-      workspace: "/mnt/d/WorkSpace",
+      workspace: "/home/user/work",
       created_at: "2026-07-01T00:00:00.000Z",
       modified_at: "2026-07-02T00:00:00.000Z",
       bytes: 1234
@@ -559,7 +559,7 @@ test("session listing is a minimal directory unless details are requested", asyn
     session_id: "session-1",
     lifecycle: "running",
     process_status: "running",
-    workspace: "/mnt/d/WorkSpace/pi-local-mcp",
+    workspace: "/home/user/pi-wsl-mcp",
     profile: "review",
     created_at: "2026-08-01T00:00:00.000Z",
     pi_session_id: "pi-1",
@@ -572,7 +572,7 @@ test("session listing is a minimal directory unless details are requested", asyn
   assert.equal(compact.live_sessions[0].pending_ui_requests, undefined);
   assert.deepEqual(compact.saved_sessions[0], {
     pi_session_id: "pi-9",
-    workspace: "/mnt/d/WorkSpace",
+    workspace: "/home/user/work",
     created_at: "2026-07-01T00:00:00.000Z",
     modified_at: "2026-07-02T00:00:00.000Z"
   });
@@ -653,13 +653,13 @@ test("compact run snapshots carry bounded progress without an ETA", () => {
       { type: "agent_start", at: "2026-08-01T00:00:10.000Z" },
       { type: "tool_execution_start", tool_call_id: "t1", tool_name: "read", at: "2026-08-01T00:00:20.000Z" }
     ],
-    lastTool: { name: "read", status: "running", at: "2026-08-01T00:00:20.000Z", target: "/mnt/d/WorkSpace/package.json" }
+    lastTool: { name: "read", status: "running", at: "2026-08-01T00:00:20.000Z", target: "/home/user/work/package.json" }
   });
   const snapshot = jobSnapshot(job);
   assert.deepEqual(snapshot.progress, {
     phase: "model_working",
     last_activity_at: "2026-08-01T00:00:20.000Z",
-    latest_tool: { name: "read", status: "running", target: "/mnt/d/WorkSpace/package.json" }
+    latest_tool: { name: "read", status: "running", target: "/home/user/work/package.json" }
   });
   assert.equal(snapshot.progress.eta, undefined, "progress must never invent an ETA");
   assert.equal(snapshot.progress.latest_tool.result, undefined, "progress must not carry tool result payloads");
@@ -694,10 +694,10 @@ test("tool completion updates latest tool status and target stays bounded", () =
     type: "tool_execution_start",
     toolCallId: "t1",
     toolName: "read",
-    args: { path: "/mnt/d/WorkSpace/package.json" }
+    args: { path: "/home/user/work/package.json" }
   });
   assert.equal(job.lastTool.status, "running");
-  assert.equal(job.lastTool.target, "/mnt/d/WorkSpace/package.json");
+  assert.equal(job.lastTool.target, "/home/user/work/package.json");
   service.handleEvent({ job }, {
     type: "tool_execution_end",
     toolCallId: "t1",
@@ -706,7 +706,7 @@ test("tool completion updates latest tool status and target stays bounded", () =
     result: "huge payload"
   });
   assert.equal(job.lastTool.status, "completed");
-  assert.equal(job.lastTool.target, "/mnt/d/WorkSpace/package.json");
+  assert.equal(job.lastTool.target, "/home/user/work/package.json");
   assert.equal(jobSnapshot(job).progress.latest_tool.result, undefined);
   service.handleEvent({ job }, {
     type: "tool_execution_start",
@@ -723,7 +723,7 @@ test("live directory entries expose an explicit process_status alongside lifecyc
   const busy = {
     id: "session-1",
     lifecycle: "running",
-    workspace: "/mnt/d/WorkSpace/pi-local-mcp",
+    workspace: "/home/user/pi-wsl-mcp",
     profile: { id: "review" },
     createdAt: "2026-08-01T00:00:00.000Z",
     state: { sessionId: "pi-1", sessionName: "Review pass" },
@@ -784,6 +784,186 @@ test("unexpected process exit settles the run and clears deferred auto_close sta
   assert.match(job.error, /exited before the run settled/);
   assert.equal(session.autoCloseJobId, null);
   assert.equal(closed, 1);
+});
+
+test("read-only profiles exclude the search function tool and keep the navigation tools", () => {
+  for (const profile of [PROFILES.review, PROFILES.research]) {
+    assert.ok(profile.tools.includes("read"), profile.id + " keeps read");
+    assert.ok(profile.tools.includes("web_search"), profile.id + " keeps web_search");
+    assert.ok(profile.tools.includes("map"), profile.id + " keeps CodeMapper navigation");
+    assert.ok(profile.tools.includes("path"), profile.id + " keeps CodeMapper navigation");
+    assert.ok(!profile.tools.includes("search"), profile.id + " must not expose a function tool named search");
+    assert.deepEqual(profile.excludeTools, ["search"], profile.id + " must exclude the search tool explicitly");
+  }
+  assert.equal(PROFILES.workspace.tools, null, "workspace keeps the normal toolset");
+  assert.equal(PROFILES.workspace.excludeTools, undefined, "workspace never gains an exclusion");
+});
+
+test("assistant message events record stop reason and raw error text", () => {
+  const service = Object.create(PiService.prototype);
+  service.config = { commandTimeoutMs: 1000 };
+  const job = activeJob({ status: "accepted" });
+  const session = { id: "session-1", job, uiRequests: new Map(), rpc: {} };
+
+  service.handleEvent(session, {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "OpenAI API error (400): the search tool conflicts with web_search",
+      usage: { input: 0, output: 0, totalTokens: 0 }
+    }
+  });
+  assert.equal(job.stopReason, "error");
+  assert.match(job.stopErrorMessage, /conflicts with web_search/);
+
+  // Non-assistant messages never touch the stop state.
+  service.handleEvent(session, { type: "message_end", message: { role: "user" } });
+  assert.equal(job.stopReason, "error");
+});
+
+test("agent_end message lists also record the stop reason when message events are missed", () => {
+  const service = Object.create(PiService.prototype);
+  service.config = { commandTimeoutMs: 1000 };
+  const job = activeJob({ status: "running" });
+  const session = { id: "session-1", job, uiRequests: new Map(), rpc: {} };
+  service.handleEvent(session, {
+    type: "agent_end",
+    messages: [
+      { role: "user" },
+      { role: "assistant", stopReason: "error", errorMessage: "boom" }
+    ]
+  });
+  assert.equal(job.stopReason, "error");
+  assert.equal(job.stopErrorMessage, "boom");
+});
+
+test("actionableRunError maps the DeepSeek web_search conflict to remediation", () => {
+  const mapped = actionableRunError({
+    stopErrorMessage: "OpenAI API error (400): {\"message\":\"The tool search in your request conflicts with server side web_search calls. Please modify your tool name or disable web_search call\"}"
+  });
+  assert.match(mapped, /function tool named "search"/);
+  assert.match(mapped, /research or review profile/);
+  assert.match(mapped, /--exclude-tools search/);
+  assert.match(mapped, /disable the provider's server-side web_search/);
+  assert.equal(actionableRunError({ stopErrorMessage: "rate limited" }), "rate limited");
+  assert.equal(actionableRunError({}), "Pi ended the run with stop_reason=error.");
+  assert.equal(actionableRunError(null), "Pi ended the run with stop_reason=error.");
+  assert.equal(
+    actionableRunError({ stopErrorMessage: "secret api_key=abc123 failed" }),
+    "secret api_key=[redacted] failed"
+  );
+});
+
+test("agent_settled with stop_reason=error ends the run as an actionable error", async () => {
+  const job = activeJob({ status: "running" });
+  const session = {
+    id: "session-1",
+    job,
+    uiRequests: new Map(),
+    rpc: { command: async () => ({ data: {} }) }
+  };
+  const service = Object.create(PiService.prototype);
+  service.config = { commandTimeoutMs: 1000 };
+  service.autoCloseIfSettled = () => null;
+
+  service.handleEvent(session, {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "OpenAI API error (400): The tool search in your request conflicts with server side web_search calls"
+    }
+  });
+  service.handleEvent(session, { type: "agent_end" });
+  service.handleEvent(session, { type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(job.status, "error", "stop_reason=error must never settle as success");
+  assert.equal(job.cleanupStatus, "completed", "collection itself completed; the run verdict is error");
+  assert.match(job.error, /function tool named "search" conflicts/);
+  assert.equal(job.result.assistant_text, null);
+  assert.equal(jobSnapshot(job).stop_reason, "error");
+  assert.equal(jobSnapshot(job).status, "error");
+});
+
+test("agent_settled without a collectable answer is an error, never an empty settled", async () => {
+  const job = activeJob({ status: "running" });
+  const session = {
+    id: "session-1",
+    job,
+    uiRequests: new Map(),
+    rpc: { command: async () => ({ data: {} }) }
+  };
+  const service = Object.create(PiService.prototype);
+  service.config = { commandTimeoutMs: 1000 };
+  service.autoCloseIfSettled = () => null;
+
+  service.handleEvent(session, { type: "agent_start" });
+  service.handleEvent(session, { type: "agent_end" });
+  service.handleEvent(session, { type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(job.status, "error");
+  assert.match(job.error, /without producing an answer text/);
+  assert.equal(jobSnapshot(job).stop_reason, null);
+});
+
+test("a budget-exhausted run without a final answer gets an explicit budget error", async () => {
+  const job = activeJob({
+    status: "running",
+    modelStatus: "running",
+    budget: { maxElapsedSeconds: null, maxModelCalls: 5, maxCost: null, exceeded: "model_calls", cancelRequested: true }
+  });
+  const session = {
+    id: "session-1",
+    job,
+    uiRequests: new Map(),
+    rpc: { command: async () => ({ data: {} }) }
+  };
+  const service = Object.create(PiService.prototype);
+  service.config = { commandTimeoutMs: 1000 };
+  service.autoCloseIfSettled = () => null;
+
+  service.handleEvent(session, { type: "agent_start" });
+  service.handleEvent(session, { type: "agent_end" });
+  service.handleEvent(session, { type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(job.status, "error", "a cancelled run without an answer must never settle as success");
+  assert.match(job.error, /max_model_calls budget was exhausted before a final answer was collected/);
+  assert.match(job.error, /Retry without that budget limit, or with a higher max_model_calls\./);
+  assert.ok(!job.error.includes("api_key") && !job.error.includes("boom"), "no raw provider text may leak");
+  // The structured snapshot still exposes the effective budget fields.
+  const snapshot = jobSnapshot(job);
+  assert.equal(snapshot.budget_exceeded, "model_calls");
+  assert.deepEqual(snapshot.budget, { max_elapsed_seconds: null, max_model_calls: 5, max_cost: null });
+  assert.equal(snapshot.status, "error");
+});
+
+test("a settled run with a real answer and no error stop reason stays settled", async () => {
+  const job = activeJob({ status: "running" });
+  const session = {
+    id: "session-1",
+    job,
+    uiRequests: new Map(),
+    rpc: { command: async () => ({ data: { text: "the official site is https://modelcontextprotocol.io" } }) }
+  };
+  const service = Object.create(PiService.prototype);
+  service.config = { commandTimeoutMs: 1000 };
+  service.autoCloseIfSettled = () => null;
+
+  service.handleEvent(session, {
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop" }
+  });
+  service.handleEvent(session, { type: "agent_end" });
+  service.handleEvent(session, { type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(job.status, "settled");
+  assert.equal(job.error, null);
+  assert.equal(job.result.assistant_text, "the official site is https://modelcontextprotocol.io");
 });
 
 test("collectFinalResult closes an auto-close session on settlement and on collection errors", async () => {
@@ -962,7 +1142,7 @@ test("task reuse requires the expected profile and rejects start-only options", 
     /cannot be combined with model/
   );
   await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", workspace: "/mnt/d/WorkSpace" }),
+    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", workspace: "/home/user/work" }),
     /cannot be combined with workspace/
   );
   await assert.rejects(

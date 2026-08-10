@@ -2,22 +2,54 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const useWindowsLauncher = process.argv.includes("--windows-launcher") || process.platform === "win32";
 const useLifecycle = process.argv.includes("--lifecycle");
 const useLegacyProtocol = process.argv.includes("--legacy");
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
+const launcherPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "run-pi-wsl-mcp.cmd");
+
+// The Windows launcher runs on the Windows side, so the smoke client must hand
+// cmd.exe a real Windows path. Inside WSL that is a wslpath -w conversion; on
+// Windows the checkout path is already native. The path is passed as a single
+// unquoted argv entry so Node applies proper MSVCRT quoting instead of the
+// backslash-escaped quotes the WSL interop layer would mangle.
+async function windowsPath(input) {
+  if (process.platform !== "win32") {
+    const { execFile } = await import("node:child_process");
+    const { stdout } = await new Promise((resolve, reject) => {
+      execFile("wslpath", ["-w", input], (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error("wslpath -w failed: " + stderr));
+        } else {
+          resolve({ stdout });
+        }
+      });
+    });
+    return stdout.trim();
+  }
+  return input;
+}
+
 const bridge = useWindowsLauncher
-  ? spawn("cmd.exe", ["/d", "/s", "/c", "D:\\WorkSpace\\pi-local-mcp\\run-pi-mcp.cmd"], {
+  ? spawn("cmd.exe", ["/d", "/s", "/c", await windowsPath(launcherPath)], {
     cwd: process.cwd(),
     stdio: ["pipe", "pipe", "pipe"],
     shell: false,
-    windowsHide: true
+    windowsHide: true,
+    // The smoke asserts the complete 20-tool protocol surface (it also calls
+    // full-only tools like pi_history/pi_start_session), so the bridge is
+    // pinned to the full toolset. The launcher forwards this into WSL via
+    // WSLENV.
+    env: { ...process.env, PI_WSL_MCP_TOOLSET: "full" }
   })
   : spawn(process.execPath, ["src/cli.mjs"], {
   cwd: process.cwd(),
   stdio: ["pipe", "pipe", "pipe"],
-  shell: false
+  shell: false,
+  env: { ...process.env, PI_WSL_MCP_TOOLSET: "full" }
   });
 
 let nextId = 1;
@@ -72,6 +104,23 @@ bridge.on("exit", (code, signal) => {
   }
 });
 
+// The default wire result carries the final Pi text exactly once, in
+// content[0].text, followed by the tool's deterministic summary line. This
+// extracts the answer between the untrusted marker and the summary.
+function answerFromContent(text, summary) {
+  const prefix = "Pi answer (untrusted):\n";
+  if (typeof text !== "string" || !text.startsWith(prefix)) {
+    return null;
+  }
+  const marker = "\n\n" + summary;
+  const end = text.indexOf(marker, prefix.length);
+  return end === -1 ? null : text.slice(prefix.length, end);
+}
+
+function answerMeta(result) {
+  return result?.structuredContent?.answer_meta;
+}
+
 function request(method, params, timeoutMs = 30000) {
   const id = nextId++;
   const requestParams = useLegacyProtocol
@@ -80,7 +129,7 @@ function request(method, params, timeoutMs = 30000) {
       ...(params || {}),
       _meta: {
         "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-        "io.modelcontextprotocol/clientInfo": { name: "pi-local-mcp-smoke", version: "0.1.0" },
+        "io.modelcontextprotocol/clientInfo": { name: "pi-wsl-mcp-smoke", version: "0.1.0" },
         "io.modelcontextprotocol/clientCapabilities": {}
       }
     };
@@ -104,10 +153,10 @@ try {
     const initialized = await request("initialize", {
       protocolVersion: "2025-11-25",
       capabilities: {},
-      clientInfo: { name: "pi-local-mcp-smoke", version: "0.1.0" }
+      clientInfo: { name: "pi-wsl-mcp-smoke", version: "0.1.0" }
     });
     assert.equal(initialized.error, undefined);
-    assert.equal(initialized.result?.serverInfo?.name, "Pi Local MCP");
+    assert.equal(initialized.result?.serverInfo?.name, "Pi WSL MCP");
     bridge.stdin.write(JSON.stringify({
       jsonrpc: "2.0",
       method: "notifications/initialized"
@@ -117,17 +166,17 @@ try {
     assert.equal(discovered.error, undefined);
     assert.equal(discovered.result?.resultType, "complete");
     assert.ok(discovered.result?.supportedVersions?.includes(MODERN_PROTOCOL_VERSION));
-    assert.equal(discovered.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.name, "Pi Local MCP");
+    assert.equal(discovered.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.name, "Pi WSL MCP");
   }
 
   const listed = await request("tools/list", {});
   assert.equal(listed.error, undefined);
   if (!useLegacyProtocol) {
     assert.equal(listed.result?.resultType, "complete");
-    assert.equal(listed.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.name, "Pi Local MCP");
+    assert.equal(listed.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.name, "Pi WSL MCP");
   }
   const names = listed.result?.tools?.map((tool) => tool.name) || [];
-  assert.equal(names.length, 20, "The Pi MCP should keep its 20-tool surface.");
+  assert.equal(names.length, 20, "Pi WSL MCP should keep its 20-tool surface.");
   for (const name of ["pi_info", "pi_task", "pi_research", "pi_review", "pi_resume_session"]) {
     assert.ok(names.includes(name), "Missing MCP tool " + name);
   }
@@ -156,7 +205,7 @@ try {
   assert.equal(info.error, undefined);
   if (!useLegacyProtocol) {
     assert.equal(info.result?.resultType, "complete");
-    assert.equal(info.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.name, "Pi Local MCP");
+    assert.equal(info.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.name, "Pi WSL MCP");
   }
   const payload = info.result?.structuredContent?.result;
   assert.ok(payload?.pi_bin?.endsWith("/pi"));
@@ -181,17 +230,29 @@ try {
     }
     assert.equal(liveResult?.timed_out, false, "Pi research did not settle before the smoke timeout.");
     assert.equal(liveResult?.run?.status, "settled");
-    assert.equal(typeof research.result?.structuredContent?.answer, "string");
-    assert.ok(research.result?.structuredContent?.answer.length > 0, "settled research must carry an answer.");
+    const researchAnswer = answerFromContent(research.result?.content?.[0]?.text, "Pi research completed.");
+    assert.notEqual(researchAnswer, null, "a settled research run must carry the final Pi text in content[0].text.");
+    assert.ok(researchAnswer && researchAnswer.length > 0, "settled research must carry an answer.");
+    const researchMeta = answerMeta(research.result);
+    assert.equal(researchMeta?.has_answer, true);
+    assert.equal(researchMeta?.truncated, false);
+    assert.ok(researchMeta?.original_chars >= researchAnswer.length);
+    assert.equal(research.result?.structuredContent?.answer, undefined, "structuredContent must not duplicate the full answer.");
     assert.equal(
       liveResult?.run?.result?.assistant_text,
-      research.result?.structuredContent?.answer,
+      researchAnswer,
       "include_details must preserve the detailed run snapshot with the assistant text."
     );
-    const toolNames = (liveResult?.run?.recent_events || [])
-      .filter((event) => event.type === "tool_execution_start")
-      .map((event) => event.tool_name);
-    assert.ok(toolNames.includes("web_search"), "The live Pi task did not invoke DeepSeek web_search.");
+    // DeepSeek's native search runs server-side: the deepseek-responses
+    // web-search extension injects {type:"web_search"} into the provider
+    // request, so there is no local Pi tool_execution_start event for it.
+    // Observable evidence is a settled, non-empty answer that cites a
+    // search-result URL - and the absence of the 400 same-name conflict.
+    assert.match(researchAnswer, /https?:\/\/\S+/, "the research answer must cite a search-result URL.");
+    assert.ok(
+      !(liveResult?.run?.recent_events || []).some((event) => event.type === "tool_execution_start" && event.tool_name === "search"),
+      "the research profile must never expose a function tool named search."
+    );
     assert.equal(
       liveResult?.session?.process_status,
       "closed",
@@ -294,17 +355,33 @@ try {
       assert.equal(workspaceTask.error, undefined);
       const workspaceResult = workspaceTask.result?.structuredContent?.result;
       assert.equal(workspaceResult?.timed_out, false);
-      assert.equal(workspaceResult?.run?.status, "settled");
-      assert.equal(workspaceTask.result?.structuredContent?.answer, workspaceResult?.run?.result?.assistant_text);
-      assert.equal(workspaceResult?.run?.progress?.phase, "settled");
-      assert.ok(workspaceResult?.run?.stats?.model_calls >= 1, "compact stats must count real assistant message_end events.");
-      assert.ok(workspaceResult?.run?.stats?.usage?.total > 0);
-      assert.ok(
-        (workspaceResult?.run?.recent_events || [])
-          .filter((event) => event.type === "tool_execution_start")
-          .some((event) => event.tool_name === "read"),
-        "The normal workspace session did not invoke Pi's read tool."
-      );
+      if (workspaceResult?.run?.status === "error") {
+        // In environments where the user's workspace toolset contains a
+        // function tool named `search` next to DeepSeek's native web_search
+        // injection, the workspace profile keeps the normal toolset (never
+        // silently rewritten) and must report the conflict as an accurate,
+        // actionable run error - never a fake settled empty answer.
+        assert.match(workspaceResult?.run?.error || "", /conflicts with the provider's server-side web_search/);
+        assert.match(workspaceResult?.run?.error || "", /--exclude-tools search/);
+        assert.equal(workspaceResult?.run?.stop_reason, "error");
+        assert.equal(workspaceTask.result?.structuredContent?.answer_meta?.has_answer, false);
+        assert.match(workspaceTask.result?.content?.[0]?.text || "", /Pi task ended with an error/);
+      } else {
+        assert.equal(workspaceResult?.run?.status, "settled");
+        const workspaceAnswer = answerFromContent(workspaceTask.result?.content?.[0]?.text, "Pi completed a new task.");
+        assert.ok(workspaceAnswer && workspaceAnswer.length > 0, "settled workspace task must carry the answer in content[0].text.");
+        assert.equal(workspaceAnswer, workspaceResult?.run?.result?.assistant_text);
+        assert.equal(workspaceTask.result?.structuredContent?.answer, undefined);
+        assert.equal(workspaceResult?.run?.progress?.phase, "settled");
+        assert.ok(workspaceResult?.run?.stats?.model_calls >= 1, "compact stats must count real assistant message_end events.");
+        assert.ok(workspaceResult?.run?.stats?.usage?.total > 0);
+        assert.ok(
+          (workspaceResult?.run?.recent_events || [])
+            .filter((event) => event.type === "tool_execution_start")
+            .some((event) => event.tool_name === "read"),
+          "The normal workspace session did not invoke Pi's read tool."
+        );
+      }
       const closeWorkspace = await request("tools/call", {
         name: "pi_close_session",
         arguments: { session_id: workspaceResult.session.session_id }
@@ -358,8 +435,9 @@ try {
       const waitedResult = waited.result?.structuredContent?.result;
       assert.equal(waitedResult?.timed_out, false, "Pi lifecycle task did not settle before the smoke timeout.");
       assert.equal(waitedResult?.run?.status, "settled");
-      assert.equal(typeof waited.result?.structuredContent?.answer, "string");
-      assert.ok(waited.result?.structuredContent?.answer.length > 0, "settled wait must carry an answer.");
+      const waitedAnswer = answerFromContent(waited.result?.content?.[0]?.text, "Pi run reached settled.");
+      assert.ok(waitedAnswer && waitedAnswer.length > 0, "settled wait must carry an answer in content[0].text.");
+      assert.equal(waited.result?.structuredContent?.answer, undefined);
       // Compact by default: no assistant-text copy and no event replay.
       assert.equal(waitedResult?.run?.result, undefined, "pi_wait must be compact by default.");
       assert.equal(waitedResult?.run?.recent_events, undefined, "pi_wait must not include recent_events by default.");
@@ -400,9 +478,9 @@ try {
       assert.equal(closed.error, undefined);
     }
     process.stdout.write(
-      "MCP live Pi smoke passed (DeepSeek web_search"
+      "MCP live Pi smoke passed (DeepSeek native web_search without the search-tool conflict"
         + (process.argv.includes("--resume") ? ", saved-session resume" : "")
-        + (process.argv.includes("--workspace") ? ", normal workspace tools" : "")
+        + (process.argv.includes("--workspace") ? ", workspace toolset (settled or actionable conflict error)" : "")
         + (useLifecycle ? ", start/send/status/wait/history lifecycle, settled review reuse + auto-close" : "")
         + ").\n"
     );

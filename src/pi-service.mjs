@@ -1,4 +1,4 @@
-import { constants as fsConstants, promises as fs } from "node:fs";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
   boundedValue,
@@ -8,8 +8,10 @@ import {
   createConfig,
   createId,
   normalizeWslPath,
-  PiLocalError,
+  PiWslError,
   readFirstLine,
+  redactText,
+  resolveExecutable,
   sleep
 } from "./util.mjs";
 import { PiRpcProcess } from "./pi-rpc.mjs";
@@ -42,24 +44,30 @@ export const PROFILES = {
     id: "review",
     title: "Read-only review",
     description: "Pi is started with an explicit read/search-only tool allowlist.",
+    // The named `search` function tool is excluded from read-only profiles:
+    // it collides with DeepSeek Responses' server-side web_search, which
+    // rejects requests that carry both (400 invalid_request_error). The
+    // remaining CodeMapper navigation tools keep working.
+    excludeTools: ["search"],
     tools: [
       "read", "grep", "find", "ls",
       "web_search", "fetch_content", "get_search_content",
       "knowledge_search", "kb_read",
       "session_search", "session_list", "session_read",
-      "map", "search", "outline", "expand", "path"
+      "map", "outline", "expand", "path"
     ]
   },
   research: {
     id: "research",
     title: "Read-only research",
     description: "Local read/search plus installed web, knowledge, and session search tools; no edit or shell tool.",
+    excludeTools: ["search"],
     tools: [
       "read", "grep", "find", "ls",
       "web_search", "fetch_content", "get_search_content",
       "knowledge_search", "kb_read",
       "session_search", "session_list", "session_read",
-      "map", "search", "outline", "expand", "path"
+      "map", "outline", "expand", "path"
     ]
   }
 };
@@ -71,7 +79,7 @@ function now() {
 function profileFor(profile) {
   const resolved = PROFILES[profile || "workspace"];
   if (!resolved) {
-    throw new PiLocalError("invalid_profile", "Unknown Pi profile: " + profile);
+    throw new PiWslError("invalid_profile", "Unknown Pi profile: " + profile);
   }
   return resolved;
 }
@@ -333,6 +341,9 @@ export function jobSnapshot(job, options = {}) {
     settled_at: job.settledAt || null,
     prompt_kind: job.kind,
     error: job.error || null,
+    // Bridge-observed model stop reason (stop/toolUse/error/aborted) from the
+    // latest assistant message; never a substitute for run settlement.
+    stop_reason: job.stopReason || null,
     pending_ui_requests: Array.from(job.uiRequests.values()),
     progress: runProgress(job),
     stats: runStats(job)
@@ -396,7 +407,8 @@ export function savedDirectoryEntry(saved, includeDetails = false) {
 
 // Directly reusable pi_wait/pi_status arguments for continuation after any
 // accepted operation or timeout. Always carries session_id; run_id is included
-// when a run exists.
+// when a run exists. Both referenced tools are registered in every toolset
+// (core and full), so returned continuations are always usable by the client.
 function continuationFor(sessionId, runId) {
   return {
     pi_wait: runId ? { session_id: sessionId, run_id: runId } : { session_id: sessionId },
@@ -434,7 +446,7 @@ function parseBudget(input) {
     }
     const number = typeof value === "number" ? value : Number(value);
     if (!Number.isFinite(number) || number <= 0 || number > maximum || (integerOnly && !Number.isInteger(number))) {
-      throw new PiLocalError(
+      throw new PiWslError(
         "invalid_budget",
         key + " must be a positive " + (integerOnly ? "integer" : "number") + " bounded by " + maximum + "."
       );
@@ -517,7 +529,7 @@ function checkRunBudget(session) {
 function resolveReuseTarget(input, expectedProfile, getSession) {
   for (const key of ["workspace", "provider", "model", "thinking", "name"]) {
     if (input[key] !== undefined && input[key] !== null && String(input[key]).trim() !== "") {
-      throw new PiLocalError(
+      throw new PiWslError(
         "reuse_conflict",
         "session_id cannot be combined with " + key + "; reusing a session keeps the live session's own " + key + "."
       );
@@ -525,16 +537,16 @@ function resolveReuseTarget(input, expectedProfile, getSession) {
   }
   const session = getSession(input.session_id);
   if (session.lifecycle !== "running") {
-    throw new PiLocalError("pi_not_running", "This Pi session is " + session.lifecycle + " and cannot be reused.");
+    throw new PiWslError("pi_not_running", "This Pi session is " + session.lifecycle + " and cannot be reused.");
   }
   if (session.profile.id !== expectedProfile.id) {
-    throw new PiLocalError(
+    throw new PiWslError(
       "profile_mismatch",
       "Session " + session.id + " runs the " + session.profile.id + " profile, but this tool requires the " + expectedProfile.id + " profile."
     );
   }
   if (session.job && ACTIVE_JOB_STATES.has(session.job.status)) {
-    throw new PiLocalError(
+    throw new PiWslError(
       "pi_busy",
       "Session " + session.id + " still has active run " + session.job.id + "; wait for it to settle before reusing the session."
     );
@@ -544,6 +556,82 @@ function resolveReuseTarget(input, expectedProfile, getSession) {
 
 function activeProcessCount(sessions) {
   return Array.from(sessions.values()).filter((session) => session.lifecycle === "running").length;
+}
+
+// Translate a raw provider/model failure into an actionable, redacted error
+// message. The known DeepSeek Responses conflict (a function tool named
+// `search` next to the server-side web_search injection) gets explicit
+// remediation guidance instead of a raw 400 echo; everything else is redacted
+// and reported as observed.
+export function actionableRunError(job) {
+  const raw = typeof job?.stopErrorMessage === "string" ? job.stopErrorMessage : "";
+  if (/conflicts with server side web_search/i.test(raw)) {
+    return "Pi's model provider rejected the run: the function tool named \"search\" conflicts with the provider's server-side web_search. Use the research or review profile (they exclude that tool automatically), or exclude/rename the conflicting \"search\" tool for this session (for example pi --exclude-tools search), or disable the provider's server-side web_search.";
+  }
+  if (raw) {
+    return redactText(raw);
+  }
+  return "Pi ended the run with stop_reason=error.";
+}
+
+// User-facing error for a run that ended because an optional budget limit
+// fired before a final answer was collected. The message names the limit and
+// how to retry; raw provider text is never included. The effective budget
+// fields stay in the structured snapshot (budget/budget_exceeded).
+export function budgetExhaustedError(job) {
+  const field = job?.budget?.exceeded === "model_calls"
+    ? "max_model_calls"
+    : job?.budget?.exceeded === "elapsed"
+      ? "max_elapsed_seconds"
+      : job?.budget?.exceeded === "cost"
+        ? "max_cost"
+        : null;
+  return field
+    ? "Pi's " + field + " budget was exhausted before a final answer was collected, so the run was cancelled without an answer. Retry without that budget limit, or with a higher " + field + "."
+    : "Pi's budget was exhausted before a final answer was collected, so the run was cancelled without an answer. Retry without the budget limit, or with a higher limit.";
+}
+
+// After agent_settled, a run is only a real success when the model did not
+// stop with an error AND a final assistant answer text was actually
+// collected. An empty answer, a stop_reason=error, or a failed collection all
+// make the run an error: agent_settled alone is never treated as success.
+// A run cancelled by an exhausted optional budget is reported with a
+// budget-specific error instead of the generic no-answer text.
+function settleRun(job) {
+  if (job.stopReason === "error") {
+    job.status = "error";
+    job.error = actionableRunError(job);
+    return;
+  }
+  const answer = typeof job.result?.assistant_text === "string" && job.result.assistant_text.trim()
+    ? job.result.assistant_text
+    : null;
+  if (!answer) {
+    job.status = "error";
+    if (job.budget?.exceeded) {
+      job.error = budgetExhaustedError(job);
+      return;
+    }
+    job.error = "Pi settled the run without producing an answer text." + (job.stopReason ? " (stop_reason=" + job.stopReason + ")" : "");
+    return;
+  }
+  job.status = "settled";
+}
+
+// Record the model's stop reason and raw error text from the latest assistant
+// message. agent_settled alone never decides success: a stop_reason=error (for
+// example a provider 400) is a bridge-observed model failure, and the raw
+// error message feeds the actionable run error.
+function trackStopState(job, message) {
+  if (!job || !message || message.role !== "assistant") {
+    return;
+  }
+  if (typeof message.stopReason === "string" && message.stopReason) {
+    job.stopReason = message.stopReason;
+  }
+  if (typeof message.errorMessage === "string" && message.errorMessage) {
+    job.stopErrorMessage = message.errorMessage;
+  }
 }
 
 export class PiService {
@@ -562,18 +650,15 @@ export class PiService {
     try {
       this.sessionRoot = await fs.realpath(sessionRootNormalized);
     } catch (error) {
-      throw new PiLocalError("invalid_configuration", "Pi session root does not exist: " + sessionRootNormalized);
+      throw new PiWslError("invalid_configuration", "Pi session root does not exist: " + sessionRootNormalized);
     }
     const sessionRootStat = await fs.stat(this.sessionRoot);
     if (!sessionRootStat.isDirectory()) {
-      throw new PiLocalError("invalid_configuration", "Pi session root is not a directory.");
+      throw new PiWslError("invalid_configuration", "Pi session root is not a directory.");
     }
-    this.config.piBin = normalizeWslPath(this.config.piBin, "Pi binary");
-    try {
-      await fs.access(this.config.piBin, fsConstants.X_OK);
-    } catch (error) {
-      throw new PiLocalError("invalid_configuration", "Pi binary is not executable: " + this.config.piBin);
-    }
+    // Bare command names resolve through the inherited interactive zsh PATH;
+    // absolute paths (WSL or Windows drive paths) are normalized and checked.
+    this.config.piBin = await resolveExecutable(this.config.piBin, "Pi binary");
     return this.diagnostics();
   }
 
@@ -600,7 +685,7 @@ export class PiService {
   getSession(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) {
-      throw new PiLocalError("unknown_session", "No live Pi session exists with id " + sessionId + ".");
+      throw new PiWslError("unknown_session", "No live Pi session exists with id " + sessionId + ".");
     }
     return session;
   }
@@ -724,6 +809,13 @@ export class PiService {
         } else if (event?.type === "message_end") {
           this.aggregateMessageUsage(job, event.message);
         }
+        if (event?.type === "message_start" || event?.type === "message_end" || event?.type === "turn_end") {
+          trackStopState(job, event.message);
+        } else if (event?.type === "agent_end" && Array.isArray(event.messages)) {
+          for (const message of event.messages) {
+            trackStopState(job, message);
+          }
+        }
       }
       if (job.events.length > 120) {
         job.events.shift();
@@ -782,8 +874,8 @@ export class PiService {
       job.result = {
         assistant_text: response?.data?.text ?? null
       };
-      job.status = "settled";
       job.cleanupStatus = "completed";
+      settleRun(job);
     } catch (error) {
       if (session.job !== job) {
         return;
@@ -797,9 +889,9 @@ export class PiService {
 
   async startSession(input = {}) {
     if (activeProcessCount(this.sessions) >= this.config.maxSessions) {
-      throw new PiLocalError(
+      throw new PiWslError(
         "session_limit_reached",
-        "The Pi MCP has reached its " + this.config.maxSessions + " live-session limit. Close a session before starting another."
+        "The Pi WSL MCP has reached its " + this.config.maxSessions + " live-session limit. Close a session before starting another."
       );
     }
     const workspace = await this.resolveWorkspace(input.workspace);
@@ -831,7 +923,7 @@ export class PiService {
       session.lifecycle = "running";
       if (input.provider || input.model) {
         if (!input.provider || !input.model) {
-          throw new PiLocalError("invalid_model", "provider and model must be set together.");
+          throw new PiWslError("invalid_model", "provider and model must be set together.");
         }
         const modelResponse = await rpc.command({
           type: "set_model",
@@ -976,13 +1068,13 @@ export class PiService {
   async send(input) {
     const session = this.getSession(input.session_id);
     if (session.lifecycle !== "running") {
-      throw new PiLocalError("pi_not_running", "This Pi session is " + session.lifecycle + ".");
+      throw new PiWslError("pi_not_running", "This Pi session is " + session.lifecycle + ".");
     }
     const behavior = input.behavior || "prompt";
     const existing = session.job;
     if (behavior === "prompt") {
       if (existing && ACTIVE_JOB_STATES.has(existing.status)) {
-        throw new PiLocalError(
+        throw new PiWslError(
           "pi_busy",
           "Pi is still working. Use behavior=steer or behavior=follow_up, or wait for run " + existing.id + "."
         );
@@ -1025,14 +1117,14 @@ export class PiService {
           job.error = message;
           job.settledAt = now();
         }
-        const code = error instanceof PiLocalError ? error.code : "prompt_failed";
-        const priorDetails = error instanceof PiLocalError &&
+        const code = error instanceof PiWslError ? error.code : "prompt_failed";
+        const priorDetails = error instanceof PiWslError &&
           error.details &&
           typeof error.details === "object" &&
           !Array.isArray(error.details)
           ? error.details
           : {};
-        throw new PiLocalError(code, message, {
+        throw new PiWslError(code, message, {
           ...priorDetails,
           accepted_result: {
             answer: null,
@@ -1052,11 +1144,11 @@ export class PiService {
     }
 
     if (!existing || !ACTIVE_JOB_STATES.has(existing.status)) {
-      throw new PiLocalError("no_active_run", "No active Pi run is available for " + behavior + ".");
+      throw new PiWslError("no_active_run", "No active Pi run is available for " + behavior + ".");
     }
     const command = behavior === "steer" ? "steer" : behavior === "follow_up" ? "follow_up" : null;
     if (!command) {
-      throw new PiLocalError("invalid_behavior", "behavior must be prompt, steer, or follow_up.");
+      throw new PiWslError("invalid_behavior", "behavior must be prompt, steer, or follow_up.");
     }
     await session.rpc.command({ type: command, message: input.message });
     existing.events.push({ type: command + "_accepted", at: now() });
@@ -1071,7 +1163,7 @@ export class PiService {
     const session = this.getSession(input.session_id);
     const job = session.job;
     if (!job || (input.run_id && input.run_id !== job.id)) {
-      throw new PiLocalError("unknown_run", "No matching current run exists for this Pi session.");
+      throw new PiWslError("unknown_run", "No matching current run exists for this Pi session.");
     }
     const maxWaitSeconds = this.config?.maxWaitSeconds ?? 285;
     const requestedSeconds = input.timeout_seconds ?? 120;
@@ -1132,7 +1224,7 @@ export class PiService {
     const session = this.getSession(input.session_id);
     const job = session.job;
     if (!job || !ACTIVE_JOB_STATES.has(job.status)) {
-      throw new PiLocalError("no_active_run", "No active Pi run can be cancelled.");
+      throw new PiWslError("no_active_run", "No active Pi run can be cancelled.");
     }
     await session.rpc.command({ type: "abort" });
     clearBudgetTimer(job);
@@ -1148,11 +1240,11 @@ export class PiService {
   async respondToUi(input) {
     const session = this.getSession(input.session_id);
     if (!session.uiRequests.has(input.request_id)) {
-      throw new PiLocalError("unknown_ui_request", "That UI request is not pending for this Pi session.");
+      throw new PiWslError("unknown_ui_request", "That UI request is not pending for this Pi session.");
     }
     const provided = [input.value !== undefined, input.confirmed !== undefined, input.cancelled === true].filter(Boolean).length;
     if (provided !== 1) {
-      throw new PiLocalError("invalid_ui_response", "Provide exactly one of value, confirmed, or cancelled.");
+      throw new PiWslError("invalid_ui_response", "Provide exactly one of value, confirmed, or cancelled.");
     }
     await session.rpc.respondToUi({
       id: input.request_id,
@@ -1347,7 +1439,7 @@ export class PiService {
         // Continue searching when a single historical file is unusable.
       }
     }
-    throw new PiLocalError("saved_session_not_found", "No allowed saved Pi session exists with id " + piSessionId + ".");
+    throw new PiWslError("saved_session_not_found", "No allowed saved Pi session exists with id " + piSessionId + ".");
   }
 
   async walkSessionFiles(maximum) {

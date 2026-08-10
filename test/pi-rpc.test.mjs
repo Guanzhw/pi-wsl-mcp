@@ -1,24 +1,52 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { PassThrough } from "node:stream";
-import { PiRpcProcess, buildPiArgs } from "../src/pi-rpc.mjs";
+import { EOL_EXTENSION_PATH, PiRpcProcess, buildPiArgs } from "../src/pi-rpc.mjs";
 
 test("buildPiArgs preserves normal Pi behavior for workspace and constrains read-only profiles", () => {
   assert.deepEqual(
-    buildPiArgs({ profile: { id: "workspace", tools: null } }),
-    ["--mode", "rpc"]
+    buildPiArgs({
+      profile: { id: "workspace", tools: null },
+      extensionPath: "/opt/pi-wsl-mcp/eol-extension.mjs"
+    }),
+    ["--mode", "rpc", "--extension", "/opt/pi-wsl-mcp/eol-extension.mjs"]
   );
   assert.deepEqual(
     buildPiArgs({
-      profile: { id: "review", tools: ["read", "grep", "web_search"] },
-      sessionPath: "/home/qq110/.pi/agent/sessions/example.jsonl"
+      profile: { id: "review", tools: ["read", "grep", "web_search"], excludeTools: ["search"] },
+      sessionPath: "/home/user/.pi/agent/sessions/example.jsonl",
+      extensionPath: "/opt/pi-wsl-mcp/eol-extension.mjs"
     }),
     [
       "--mode", "rpc",
-      "--session", "/home/qq110/.pi/agent/sessions/example.jsonl",
-      "--tools", "read,grep,web_search"
+      "--session", "/home/user/.pi/agent/sessions/example.jsonl",
+      "--tools", "read,grep,web_search",
+      // The named `search` function tool is excluded so it cannot collide
+      // with DeepSeek Responses' server-side web_search injection.
+      "--exclude-tools", "search",
+      "--extension", "/opt/pi-wsl-mcp/eol-extension.mjs"
     ]
   );
+  // A workspace profile with no allowlist never gains the exclusion: normal
+  // Pi tools (including any user-composed `search` tool) stay untouched.
+  assert.deepEqual(
+    buildPiArgs({
+      profile: { id: "workspace", tools: null },
+      sessionPath: "/home/user/.pi/agent/sessions/example.jsonl",
+      extensionPath: "/opt/pi-wsl-mcp/eol-extension.mjs"
+    }),
+    [
+      "--mode", "rpc",
+      "--session", "/home/user/.pi/agent/sessions/example.jsonl",
+      "--extension", "/opt/pi-wsl-mcp/eol-extension.mjs"
+    ]
+  );
+});
+
+test("buildPiArgs defaults to the bundled session-scoped EOL extension", () => {
+  assert.ok(EOL_EXTENSION_PATH.replace(/\\/g, "/").endsWith("/src/eol-extension.mjs"));
+  const args = buildPiArgs({ profile: { id: "workspace", tools: null } });
+  assert.deepEqual(args, ["--mode", "rpc", "--extension", EOL_EXTENSION_PATH]);
 });
 
 test("PiRpcProcess frames streamed JSONL responses and events", async () => {

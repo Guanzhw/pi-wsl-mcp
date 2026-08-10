@@ -2,12 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createPiMcpServer } from "../src/server.mjs";
-import { PiLocalError } from "../src/util.mjs";
+import { PiWslError } from "../src/util.mjs";
 
-async function withClient(service, run) {
-  const server = createPiMcpServer(service);
+async function withClient(service, run, options = {}) {
+  // The helper pins the full toolset by default because the existing tests
+  // exercise the complete 20-tool surface. Tests proving the server's own
+  // default-core behavior pass injectToolset: false; an explicit toolset
+  // option selects that surface directly.
+  const configured = options.injectToolset === false
+    ? service
+    : { ...service, config: { toolset: options.toolset ?? "full", ...(service?.config || {}) } };
+  const server = createPiMcpServer(configured);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: "pi-local-mcp-test", version: "0.1.0" });
+  const client = new Client({ name: "pi-wsl-mcp-test", version: "0.1.0" });
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   try {
@@ -17,11 +24,22 @@ async function withClient(service, run) {
   }
 }
 
+// The daily-agent workflow surface of the default core toolset and the
+// diagnostics/advanced controls that only the full toolset registers.
+const CORE_TOOLSET_TOOLS = [
+  "pi_task", "pi_research", "pi_review", "pi_send", "pi_wait", "pi_status",
+  "pi_sessions", "pi_resume_session", "pi_close_session"
+];
+const FULL_ONLY_TOOLS = [
+  "pi_info", "pi_start_session", "pi_cancel", "pi_respond_ui", "pi_history",
+  "pi_models", "pi_set_model", "pi_set_thinking", "pi_compact", "pi_fork", "pi_commands"
+];
+
 function settledTask(answer = "Pi completed the requested read-only task.") {
   return {
     timed_out: false,
     answer,
-    session: { session_id: "session-1", workspace: "/mnt/d/WorkSpace/pi-local-mcp" },
+    session: { session_id: "session-1", workspace: "/home/user/pi-wsl-mcp" },
     run: {
       run_id: "run-1",
       status: "settled",
@@ -35,9 +53,14 @@ function settledTask(answer = "Pi completed the requested read-only task.") {
 }
 
 function assertAnswerFirst(result, answer) {
-  assert.equal(result.structuredContent?.answer, answer);
-  // Compact by default: the answer channel is not duplicated inside the
-  // snapshot, and the run snapshot carries no assistant text copy.
+  // Compact by default: content[0].text is the single final-text carrier and
+  // the structured part carries answer_meta instead of a duplicate answer.
+  assert.deepEqual(result.structuredContent?.answer_meta, {
+    has_answer: true,
+    truncated: false,
+    original_chars: answer.length
+  });
+  assert.equal(result.structuredContent?.answer, undefined);
   assert.equal(result.structuredContent?.result?.answer, undefined);
   assert.equal(result.structuredContent?.result?.run?.result, undefined);
   assert.equal(result.structuredContent?.untrustedContent, true);
@@ -93,7 +116,9 @@ test("high-level task summaries distinguish a requested wait timeout", async () 
       name: "pi_task",
       arguments: { message: "Continue the task.", wait_seconds: 30 }
     });
-    assert.equal(result.structuredContent?.answer, null);
+    assert.equal(result.structuredContent?.answer_meta?.has_answer, false);
+    assert.equal(result.structuredContent?.answer_meta?.truncated, false);
+    assert.equal(result.structuredContent?.answer_meta?.original_chars, 0);
     const payload = result.structuredContent?.result;
     assert.equal(payload.session_id, "session-1");
     assert.equal(payload.run_id, "run-1");
@@ -243,7 +268,7 @@ test("accepted run failures preserve ids and continuation in error results", asy
   };
   const service = {
     task: async () => {
-      throw new PiLocalError("prompt_failed", "prompt rejected", {
+      throw new PiWslError("prompt_failed", "prompt rejected", {
         accepted_result: acceptedResult
       });
     }
@@ -255,7 +280,7 @@ test("accepted run failures preserve ids and continuation in error results", asy
       arguments: { message: "go", wait_seconds: 0 }
     });
     assert.equal(result.isError, true);
-    assert.equal(result.structuredContent?.answer, null);
+    assert.equal(result.structuredContent?.answer_meta?.has_answer, false);
     const { answer, ...expectedResult } = acceptedResult;
     assert.deepEqual(result.structuredContent?.result, expectedResult);
     assert.equal(result.structuredContent?.untrustedContent, true);
@@ -312,7 +337,7 @@ test("session lifecycle tools keep their thin MCP mapping and pi_wait is answer-
     },
     wait: async (input) => {
       calls.push(["wait", input]);
-      return settledTask("The package name is pi-local-mcp.");
+      return settledTask("The package name is pi-wsl-mcp.");
     },
     history: async (input) => {
       calls.push(["history", input]);
@@ -353,7 +378,8 @@ test("session lifecycle tools keep their thin MCP mapping and pi_wait is answer-
       name: "pi_wait",
       arguments: { session_id: "session-1", run_id: "run-1", timeout_seconds: 30 }
     });
-    assert.equal(waited.structuredContent?.answer, "The package name is pi-local-mcp.");
+    assert.equal(waited.structuredContent?.answer_meta?.has_answer, true);
+    assert.equal(waited.structuredContent?.answer_meta?.truncated, false);
     assert.match(waited.content?.[0]?.text || "", /^Pi answer \(untrusted\):/);
     // Compact by default: no assistant-text copy and no event replay.
     assert.equal(waited.structuredContent?.result?.run?.result, undefined);
@@ -385,7 +411,7 @@ test("include_details restores the full diagnostic run snapshot and is threaded 
       inputs.push(input);
       return {
         timed_out: false,
-        answer: "The package name is pi-local-mcp.",
+        answer: "The package name is pi-wsl-mcp.",
         session: { session_id: "session-1" },
         run: {
           run_id: "run-1",
@@ -395,7 +421,7 @@ test("include_details restores the full diagnostic run snapshot and is threaded 
           prompt_kind: "prompt",
           error: null,
           pending_ui_requests: [],
-          result: { assistant_text: "The package name is pi-local-mcp." },
+          result: { assistant_text: "The package name is pi-wsl-mcp." },
           streamed_message_updates: 3,
           recent_events: [
             { type: "tool_execution_start", tool_call_id: "t1", tool_name: "read", at: "2026-08-01T00:00:30.000Z" },
@@ -412,8 +438,12 @@ test("include_details restores the full diagnostic run snapshot and is threaded 
       arguments: { message: "Read package.json.", include_details: true }
     });
     assert.equal(inputs[0].include_details, true);
-    assert.equal(result.structuredContent?.answer, "The package name is pi-local-mcp.");
-    assert.equal(result.structuredContent?.result?.run?.result?.assistant_text, "The package name is pi-local-mcp.");
+    assert.deepEqual(result.structuredContent?.answer_meta, {
+      has_answer: true,
+      truncated: false,
+      original_chars: "The package name is pi-wsl-mcp.".length
+    });
+    assert.equal(result.structuredContent?.result?.run?.result?.assistant_text, "The package name is pi-wsl-mcp.");
     assert.equal(result.structuredContent?.result?.run?.recent_events?.length, 2);
     assert.equal(result.structuredContent?.result?.run?.streamed_message_updates, 3);
     // The answer channel still is not duplicated at the top level of the result.
@@ -431,7 +461,9 @@ test("include_details restores the full diagnostic run snapshot and is threaded 
   }));
   assert.equal(inputs[1].include_details, true);
   assert.equal(inputs[1].profile, "research");
-  assert.equal(research.structuredContent?.answer, "Searched sources.");
+  assert.equal(research.structuredContent?.answer_meta?.has_answer, true);
+  assert.equal(research.structuredContent?.answer_meta?.truncated, false);
+  assert.match(research.content?.[0]?.text || "", /Searched sources\./);
 });
 
 test("high-level tools thread session_id reuse and auto_close; reuse suppresses start-only defaults", async () => {
@@ -491,7 +523,7 @@ test("reuse conflicts surface as tool errors with the service code", async () =>
   const service = {
     task: async (input) => {
       if (input.session_id && input.provider) {
-        throw new PiLocalError("reuse_conflict", "session_id cannot be combined with provider.");
+        throw new PiWslError("reuse_conflict", "session_id cannot be combined with provider.");
       }
       return settledTask();
     }
@@ -522,7 +554,7 @@ test("pi_sessions lists a minimal session directory and include_details restores
         session_id: "session-1",
         lifecycle: "running",
         process_status: "running",
-        workspace: "/mnt/d/WorkSpace/pi-local-mcp",
+        workspace: "/home/user/pi-wsl-mcp",
         profile: "review",
         created_at: "2026-08-01T00:00:00.000Z",
         pi_session_id: "pi-1",
@@ -532,7 +564,7 @@ test("pi_sessions lists a minimal session directory and include_details restores
       };
       const saved = [{
         pi_session_id: "pi-9",
-        workspace: "/mnt/d/WorkSpace",
+        workspace: "/home/user/work",
         created_at: "2026-07-01T00:00:00.000Z",
         modified_at: "2026-07-02T00:00:00.000Z"
       }];
@@ -565,7 +597,7 @@ test("pi_sessions lists a minimal session directory and include_details restores
     const compactSaved = compact.structuredContent?.result?.saved_sessions?.[0];
     assert.deepEqual(compactSaved, {
       pi_session_id: "pi-9",
-      workspace: "/mnt/d/WorkSpace",
+      workspace: "/home/user/work",
       created_at: "2026-07-01T00:00:00.000Z",
       modified_at: "2026-07-02T00:00:00.000Z"
     });
@@ -583,6 +615,72 @@ test("pi_sessions lists a minimal session directory and include_details restores
     assert.equal(detailed.structuredContent?.result?.saved_sessions?.[0]?.bytes, 1234);
     assert.equal(detailed.structuredContent?.result?.saved_sessions?.[0]?.session_file, undefined);
     assert.ok(calls[1].include_details);
+  });
+});
+
+test("PI_WSL_MCP_RESULT_LIMIT bounds the final answer and truncation is explicit", async () => {
+  const longAnswer = "The package name is pi-wsl-mcp and it bridges the Pi coding agent into MCP hosts from WSL. ".repeat(4);
+  const service = {
+    config: { resultLimit: 60 },
+    task: async () => ({
+      timed_out: false,
+      answer: longAnswer,
+      session: { session_id: "session-1" },
+      run: { run_id: "run-1", status: "settled", error: null, pending_ui_requests: [] }
+    })
+  };
+  await withClient(service, async (client) => {
+    const result = await client.callTool({
+      name: "pi_task",
+      arguments: { message: "go", wait_seconds: 0 }
+    });
+    const meta = result.structuredContent?.answer_meta;
+    assert.deepEqual(meta, { has_answer: true, truncated: true, original_chars: longAnswer.length });
+    // The final text lives exactly once: in content[0].text, cut at the limit
+    // with an explicit truncation marker, never duplicated in structured data.
+    const text = result.content?.[0]?.text || "";
+    assert.ok(text.startsWith("Pi answer (untrusted):\n"));
+    const summaryStart = text.indexOf("\n\nPi completed a new task.");
+    assert.ok(summaryStart > 0, "the summary must follow the bounded answer");
+    const shown = text.slice("Pi answer (untrusted):\n".length, summaryStart);
+    assert.equal(shown.length, 60 + "\n… [truncated]".length);
+    assert.ok(shown.endsWith("… [truncated]"));
+    assert.equal(result.structuredContent?.answer, undefined);
+    assert.ok(!JSON.stringify(result.structuredContent).includes(longAnswer.slice(0, 200)), "the full answer must not be duplicated in structuredContent");
+  });
+});
+
+test("error results carry answer_meta with no answer and keep the accepted snapshot", async () => {
+  const service = {
+    task: async () => {
+      throw new PiWslError("prompt_failed", "prompt rejected", {
+        accepted_result: {
+          answer: null,
+          session_id: "session-accepted",
+          run_id: "run-accepted",
+          session: { session_id: "session-accepted", process_status: "running" },
+          run: { run_id: "run-accepted", status: "error", error: "prompt rejected" },
+          continuation: {
+            pi_wait: { session_id: "session-accepted", run_id: "run-accepted" },
+            pi_status: { session_id: "session-accepted" }
+          }
+        }
+      });
+    }
+  };
+  await withClient(service, async (client) => {
+    const result = await client.callTool({
+      name: "pi_task",
+      arguments: { message: "go", wait_seconds: 0 }
+    });
+    assert.equal(result.isError, true);
+    assert.deepEqual(result.structuredContent?.answer_meta, {
+      has_answer: false,
+      truncated: false,
+      original_chars: 0
+    });
+    assert.equal(result.structuredContent?.answer, undefined);
+    assert.equal(result.structuredContent?.result?.run?.status, "error");
   });
 });
 
@@ -618,5 +716,134 @@ test("pi_wait accepts include_details and reflects it in the run snapshot", asyn
     assert.equal(result.structuredContent?.result?.run?.pending_ui_requests?.[0]?.id, "confirm-1");
     const text = result.content?.[0]?.text || "";
     assert.ok(!text.includes("recent_events"), "no-answer text must stay concise even with include_details");
+  });
+});
+
+test("the default core toolset registers exactly the daily-agent workflow tools", async () => {
+  // injectToolset: false keeps the service untouched, so the server's own
+  // default (core, matching createConfig) is exercised.
+  await withClient({ task: async () => settledTask() }, async (client) => {
+    const tools = await client.listTools();
+    const names = tools.tools.map((tool) => tool.name).sort();
+    assert.deepEqual(names, [...CORE_TOOLSET_TOOLS].sort(), "core must register exactly the daily-agent workflow tools");
+    for (const name of FULL_ONLY_TOOLS) {
+      assert.ok(!tools.tools.some((tool) => tool.name === name), "core must not register " + name);
+    }
+    const instructions = client.getInstructions() || "";
+    assert.match(instructions, /Core toolset \(PI_WSL_MCP_TOOLSET=core\)/);
+    assert.ok(!instructions.includes("pi_history"), "core instructions must not advertise full-only tools");
+  }, { injectToolset: false });
+});
+
+test("the full toolset registers all 20 tools with their current names and core keeps its 9", async () => {
+  const core = await withClient({ task: async () => settledTask() }, async (client) => {
+    const names = (await client.listTools()).tools.map((tool) => tool.name);
+    assert.equal(names.length, CORE_TOOLSET_TOOLS.length);
+    assert.match(client.getInstructions() || "", /Core toolset/);
+    return names;
+  }, { toolset: "core" });
+
+  const full = await withClient({ task: async () => settledTask() }, async (client) => {
+    const tools = await client.listTools();
+    const names = tools.tools.map((tool) => tool.name);
+    assert.equal(names.length, 20, "full must keep the complete 20-tool surface");
+    for (const name of [...CORE_TOOLSET_TOOLS, ...FULL_ONLY_TOOLS]) {
+      assert.ok(names.includes(name), "full must register " + name);
+    }
+    assert.match(client.getInstructions() || "", /Use pi_research or pi_review for enforced read-only work\./);
+    return names;
+  });
+
+  for (const name of CORE_TOOLSET_TOOLS) {
+    assert.ok(full.includes(name), "full must keep the core tool " + name);
+  }
+  assert.ok(full.includes("pi_info") && !core.includes("pi_info"));
+  assert.ok(full.includes("pi_history") && !core.includes("pi_history"));
+  assert.ok(full.includes("pi_steer") === false, "pi_steer must never be registered");
+});
+
+test("an explicit core toolset config registers the same surface as the default", async () => {
+  await withClient({ task: async () => settledTask() }, async (client) => {
+    const names = (await client.listTools()).tools.map((tool) => tool.name);
+    assert.deepEqual(names.sort(), [...CORE_TOOLSET_TOOLS].sort());
+  }, { toolset: "core" });
+});
+
+test("budget-exhausted runs without a final answer say so and keep the structured budget fields", async () => {
+  const service = {
+    task: async () => ({
+      timed_out: false,
+      answer: null,
+      session_id: "session-budget",
+      run_id: "run-budget",
+      session: { session_id: "session-budget", process_status: "running" },
+      run: {
+        run_id: "run-budget",
+        status: "error",
+        error: "Pi's max_model_calls budget was exhausted before a final answer was collected.",
+        budget: { max_elapsed_seconds: 60, max_model_calls: 5, max_cost: null },
+        budget_exceeded: "model_calls",
+        pending_ui_requests: []
+      },
+      continuation: {
+        pi_wait: { session_id: "session-budget", run_id: "run-budget" },
+        pi_status: { session_id: "session-budget" }
+      }
+    })
+  };
+
+  await withClient(service, async (client) => {
+    const result = await client.callTool({
+      name: "pi_task",
+      arguments: { message: "go", wait_seconds: 30, max_model_calls: 5 }
+    });
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(result.structuredContent?.answer_meta, {
+      has_answer: false,
+      truncated: false,
+      original_chars: 0
+    });
+    // Structured budget fields are preserved verbatim.
+    assert.equal(result.structuredContent?.result?.run?.budget_exceeded, "model_calls");
+    assert.deepEqual(result.structuredContent?.result?.run?.budget, {
+      max_elapsed_seconds: 60,
+      max_model_calls: 5,
+      max_cost: null
+    });
+    const text = result.content?.[0]?.text || "";
+    assert.match(text, /max_model_calls=5 budget was exhausted before a final answer was collected/);
+    assert.match(text, /run was cancelled without an answer/);
+    assert.match(text, /Retry without that budget limit, or with a higher max_model_calls/);
+    assert.match(text, /structured result keeps the effective budget fields/);
+    assert.ok(!text.includes("api_key") && !text.includes("provider error"), "no raw provider text may leak");
+    assert.ok(text.endsWith("\n\nsession session-budget · run run-budget"));
+  });
+});
+
+test("elapsed and cost budget exhaustion get the same explicit no-answer treatment", async () => {
+  const service = {
+    wait: async () => ({
+      timed_out: false,
+      answer: null,
+      session: { session_id: "session-1" },
+      run: {
+        run_id: "run-1",
+        status: "error",
+        error: null,
+        budget: { max_elapsed_seconds: 30, max_model_calls: null, max_cost: null },
+        budget_exceeded: "elapsed",
+        pending_ui_requests: []
+      }
+    })
+  };
+  await withClient(service, async (client) => {
+    const result = await client.callTool({
+      name: "pi_wait",
+      arguments: { session_id: "session-1", run_id: "run-1", timeout_seconds: 5 }
+    });
+    const text = result.content?.[0]?.text || "";
+    assert.match(text, /max_elapsed_seconds=30 budget was exhausted/);
+    assert.match(text, /with a higher max_elapsed_seconds/);
+    assert.equal(result.structuredContent?.result?.run?.budget_exceeded, "elapsed");
   });
 });

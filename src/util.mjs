@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const SENSITIVE_KEY = /(?:api[_-]?key|authorization|bearer|cookie|credential|pass(?:word)?|secret|token)/i;
@@ -8,10 +9,10 @@ const BEARER_VALUE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 const WINDOWS_DRIVE_PATH = /^([a-z]):[\\/](.*)$/i;
 const WSL_UNC_PATH = /^\\\\wsl(?:\.localhost)?\\[^\\]+\\(.*)$/i;
 
-export class PiLocalError extends Error {
+export class PiWslError extends Error {
   constructor(code, message, details) {
     super(message);
-    this.name = "PiLocalError";
+    this.name = "PiWslError";
     this.code = code;
     this.details = details;
   }
@@ -27,7 +28,7 @@ export function positiveInteger(value, fallback, minimum, maximum) {
   }
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
-    throw new PiLocalError(
+    throw new PiWslError(
       "invalid_configuration",
       "Expected an integer between " + minimum + " and " + maximum + "."
     );
@@ -37,11 +38,11 @@ export function positiveInteger(value, fallback, minimum, maximum) {
 
 export function normalizeWslPath(value, label = "path") {
   if (typeof value !== "string") {
-    throw new PiLocalError("invalid_path", label + " must be a string.");
+    throw new PiWslError("invalid_path", label + " must be a string.");
   }
   const trimmed = value.trim();
   if (!trimmed || trimmed.includes("\0")) {
-    throw new PiLocalError("invalid_path", label + " must be a non-empty path without NUL bytes.");
+    throw new PiWslError("invalid_path", label + " must be a non-empty path without NUL bytes.");
   }
 
   const drive = trimmed.match(WINDOWS_DRIVE_PATH);
@@ -55,13 +56,13 @@ export function normalizeWslPath(value, label = "path") {
   }
 
   if (trimmed.includes("\\")) {
-    throw new PiLocalError(
+    throw new PiWslError(
       "invalid_path",
       label + " must be a WSL path or a Windows drive path; generic UNC paths are not supported."
     );
   }
   if (!path.posix.isAbsolute(trimmed)) {
-    throw new PiLocalError("invalid_path", label + " must be absolute.");
+    throw new PiWslError("invalid_path", label + " must be absolute.");
   }
   return path.posix.normalize(trimmed);
 }
@@ -77,6 +78,9 @@ export function splitPathList(value) {
 }
 
 export function isPathWithin(candidate, root) {
+  // Callers must pass canonical paths: this is intentionally a lexical
+  // containment check, while canonicalDirectory/canonicalRoots resolve
+  // symlinks with fs.realpath before calling it.
   const relative = path.relative(root, candidate);
   return relative === "" || (!relative.startsWith(".." + path.sep) && relative !== ".." && !path.isAbsolute(relative));
 }
@@ -87,19 +91,19 @@ export async function canonicalDirectory(input, roots, label = "workspace") {
   try {
     canonical = await fs.realpath(normalized);
   } catch (error) {
-    throw new PiLocalError("workspace_not_found", label + " does not exist: " + normalized);
+    throw new PiWslError("workspace_not_found", label + " does not exist: " + normalized);
   }
   let stat;
   try {
     stat = await fs.stat(canonical);
   } catch (error) {
-    throw new PiLocalError("workspace_not_found", label + " cannot be inspected: " + normalized);
+    throw new PiWslError("workspace_not_found", label + " cannot be inspected: " + normalized);
   }
   if (!stat.isDirectory()) {
-    throw new PiLocalError("invalid_workspace", label + " must be a directory.");
+    throw new PiWslError("invalid_workspace", label + " must be a directory.");
   }
   if (!roots.some((root) => isPathWithin(canonical, root))) {
-    throw new PiLocalError(
+    throw new PiWslError(
       "workspace_not_allowed",
       label + " is outside the configured allowed roots.",
       { workspace: canonical }
@@ -116,18 +120,18 @@ export async function canonicalRoots(inputs) {
     try {
       canonical = await fs.realpath(normalized);
     } catch (error) {
-      throw new PiLocalError("invalid_configuration", "Allowed root does not exist: " + normalized);
+      throw new PiWslError("invalid_configuration", "Allowed root does not exist: " + normalized);
     }
     const stat = await fs.stat(canonical);
     if (!stat.isDirectory()) {
-      throw new PiLocalError("invalid_configuration", "Allowed root is not a directory: " + normalized);
+      throw new PiWslError("invalid_configuration", "Allowed root is not a directory: " + normalized);
     }
     if (!roots.includes(canonical)) {
       roots.push(canonical);
     }
   }
   if (roots.length === 0) {
-    throw new PiLocalError("invalid_configuration", "At least one allowed root is required.");
+    throw new PiWslError("invalid_configuration", "At least one allowed root is required.");
   }
   return roots;
 }
@@ -138,14 +142,14 @@ export async function canonicalFileWithin(input, root, label = "file") {
   try {
     canonical = await fs.realpath(normalized);
   } catch (error) {
-    throw new PiLocalError("file_not_found", label + " does not exist.");
+    throw new PiWslError("file_not_found", label + " does not exist.");
   }
   if (!isPathWithin(canonical, root)) {
-    throw new PiLocalError("file_not_allowed", label + " is outside the Pi session store.");
+    throw new PiWslError("file_not_allowed", label + " is outside the Pi session store.");
   }
   const stat = await fs.stat(canonical);
   if (!stat.isFile()) {
-    throw new PiLocalError("invalid_file", label + " must be a regular file.");
+    throw new PiWslError("invalid_file", label + " must be a regular file.");
   }
   return canonical;
 }
@@ -220,7 +224,7 @@ export async function readFirstLine(filePath, maximum = 65536) {
     const text = buffer.subarray(0, bytesRead).toString("utf8");
     const newline = text.indexOf("\n");
     if (newline === -1 && bytesRead === maximum) {
-      throw new PiLocalError("invalid_session_file", "Pi session header is unexpectedly large.");
+      throw new PiWslError("invalid_session_file", "Pi session header is unexpectedly large.");
     }
     return text.slice(0, newline === -1 ? text.length : newline).replace(/\r$/, "");
   } finally {
@@ -232,25 +236,98 @@ export function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+// Resolve an executable for spawning. Absolute paths (WSL or Windows drive
+// paths) are normalized and checked; a bare command name is resolved through
+// the inherited PATH, which is the interactive zsh PATH when the bridge is
+// launched through the Windows launcher. This keeps the default (`pi`)
+// portable: no absolute binary path is hard-coded anywhere.
+export async function resolveExecutable(input, label = "executable", pathValue = process.env.PATH) {
+  const value = String(input).trim();
+  if (!value) {
+    throw new PiWslError("invalid_configuration", label + " must not be empty.");
+  }
+  if (value.includes("/") || WINDOWS_DRIVE_PATH.test(value)) {
+    const normalized = normalizeWslPath(value, label);
+    try {
+      await fs.access(normalized, fsConstants.X_OK);
+    } catch (error) {
+      throw new PiWslError("invalid_configuration", label + " is not executable: " + normalized);
+    }
+    return normalized;
+  }
+  const pathDirs = String(pathValue || "").split(":").filter(Boolean);
+  for (const dir of pathDirs) {
+    const candidate = path.posix.join(dir, value);
+    try {
+      await fs.access(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch (error) {
+      // Keep searching the next PATH entry.
+    }
+  }
+  throw new PiWslError("invalid_configuration", label + " was not found on PATH: " + value);
+}
+
+// PI_WSL_MCP_TOOLSET selects which MCP tool surface the bridge registers.
+// core (the default) registers only the daily-agent workflow tools; full
+// registers the complete 20-tool surface. Values are trimmed and
+// case-insensitive; anything else is a configuration error rather than a
+// silent fallback.
+export function toolsetSetting(input) {
+  if (input === undefined || input === null || input === "") {
+    return "core";
+  }
+  const normalized = String(input).trim().toLowerCase();
+  if (normalized !== "core" && normalized !== "full") {
+    throw new PiWslError(
+      "invalid_configuration",
+      "PI_WSL_MCP_TOOLSET must be \"core\" or \"full\"."
+    );
+  }
+  return normalized;
+}
+
 export function createConfig(environment = process.env) {
-  const home = environment.HOME || "/home/qq110";
-  const allowedInputs = splitPathList(environment.PI_LOCAL_MCP_ALLOWED_ROOTS);
-  const defaultWorkspace = environment.PI_LOCAL_MCP_DEFAULT_CWD || "/mnt/d/WorkSpace/OpenSession";
+  const home = environment.HOME || os.homedir();
+  // The bridge derives its portable defaults from the real WSL environment:
+  // the saved-session store under the user's home, and the default workspace
+  // and allowed roots from the bridge's current working directory (which the
+  // Windows launcher sets to the translated caller directory). The pi
+  // command itself resolves through the inherited interactive zsh PATH.
+  const cwd = process.cwd();
+  // PI_WSL_MCP_* is the current configuration namespace. The PI_LOCAL_MCP_*
+  // names remain accepted as documented deprecated aliases so existing
+  // deployments keep working; the new names always win when both are set.
+  const value = (name) => {
+    const current = environment["PI_WSL_MCP_" + name];
+    if (current !== undefined && current !== "") {
+      return current;
+    }
+    const legacy = environment["PI_LOCAL_MCP_" + name];
+    return legacy !== undefined && legacy !== "" ? legacy : undefined;
+  };
+  const allowedInputs = splitPathList(value("ALLOWED_ROOTS"));
   return {
-    piBin: environment.PI_LOCAL_MCP_PI_BIN || "/home/qq110/.npm-global/bin/pi",
-    defaultWorkspace,
-    allowedRootInputs: allowedInputs.length > 0 ? allowedInputs : ["/mnt/d/WorkSpace"],
-    sessionRootInput: environment.PI_LOCAL_MCP_SESSION_ROOT || path.posix.join(home, ".pi", "agent", "sessions"),
-    maxSessions: positiveInteger(environment.PI_LOCAL_MCP_MAX_SESSIONS, 3, 1, 12),
+    // Default: the `pi` command through the interactive zsh PATH this bridge
+    // inherits. Set PI_WSL_MCP_PI_BIN only to point elsewhere.
+    piBin: value("PI_BIN") || "pi",
+    defaultWorkspace: value("DEFAULT_CWD") || cwd,
+    allowedRootInputs: allowedInputs.length > 0 ? allowedInputs : [cwd],
+    sessionRootInput: value("SESSION_ROOT") || path.posix.join(home, ".pi", "agent", "sessions"),
+    maxSessions: positiveInteger(value("MAX_SESSIONS"), 3, 1, 12),
     // The public timeout_seconds/wait_seconds acceptance stays compatible through 300,
     // but the actual blocking wait is capped here, below Codex's tool_timeout_sec=300,
     // so a wait expiring still has room to return a structured timeout result to the
     // client before the host kills the tool call.
-    maxWaitSeconds: positiveInteger(environment.PI_LOCAL_MCP_MAX_WAIT_SECONDS, 285, 5, 295),
-    maxSavedSessions: positiveInteger(environment.PI_LOCAL_MCP_MAX_SAVED_SESSIONS, 100, 1, 500),
-    startupTimeoutMs: positiveInteger(environment.PI_LOCAL_MCP_STARTUP_TIMEOUT_MS, 45000, 5000, 120000),
-    commandTimeoutMs: positiveInteger(environment.PI_LOCAL_MCP_COMMAND_TIMEOUT_MS, 30000, 1000, 120000),
-    resultLimit: positiveInteger(environment.PI_LOCAL_MCP_RESULT_LIMIT, 24000, 2000, 100000),
-    historyLimit: positiveInteger(environment.PI_LOCAL_MCP_HISTORY_LIMIT, 80, 1, 300)
+    maxWaitSeconds: positiveInteger(value("MAX_WAIT_SECONDS"), 285, 5, 295),
+    maxSavedSessions: positiveInteger(value("MAX_SAVED_SESSIONS"), 100, 1, 500),
+    startupTimeoutMs: positiveInteger(value("STARTUP_TIMEOUT_MS"), 45000, 5000, 120000),
+    commandTimeoutMs: positiveInteger(value("COMMAND_TIMEOUT_MS"), 30000, 1000, 120000),
+    resultLimit: positiveInteger(value("RESULT_LIMIT"), 24000, 2000, 100000),
+    historyLimit: positiveInteger(value("HISTORY_LIMIT"), 80, 1, 300),
+    // core (default) registers only the daily-agent workflow tools; full
+    // registers the complete 20-tool surface. PI_LOCAL_MCP_TOOLSET remains a
+    // deprecated alias with the same precedence rules as the other legacy names.
+    toolset: toolsetSetting(value("TOOLSET"))
   };
 }

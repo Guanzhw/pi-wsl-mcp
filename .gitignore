@@ -1,3 +1,3 @@
 node_modules/
 *.log
-.pi-local-mcp/
+.pi-wsl-mcp/
