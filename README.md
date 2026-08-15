@@ -1,25 +1,76 @@
 # Pi WSL MCP
 
-An MCP bridge for the Pi coding agent running in WSL. It is distributed as
-`pi-wsl-mcp` (installable from a local checkout; not yet published) and
-registers a `pi-wsl-mcp` bin command.
+Use the Pi coding agent in WSL from any MCP client without rebuilding a
+`wsl.exe` command for every task. Pi WSL MCP provides one-call tasks,
+resumable sessions, and explicit controls for long-running work while Pi keeps
+using its normal WSL environment.
+
+The package is installable from a local checkout (it is not currently
+published to npm) and registers a `pi-wsl-mcp` bin command.
 
 The bridge serves both initialization-based MCP clients and stateless
-`2026-07-28` clients over stdio. Its existing tool surface and safety profiles
-are the same in either protocol era.
-It deliberately runs Pi inside WSL, through an interactive zsh, so Pi retains
-its normal extensions, session store, workspace guard, model configuration, and
-environment-provided credentials. No API key is copied into Codex configuration
-or returned by an MCP tool.
+`2026-07-28` clients over stdio. Its existing tool surface and behavior
+profiles are the same in either protocol era.
+It runs Pi through the same interactive zsh environment used at the terminal,
+so existing extensions, models, saved sessions, and shell configuration keep
+working.
 
 This is a process bridge to Pi's supported JSONL RPC mode, not an attempt to
 reimplement Pi's agent runtime. That matters for installed extensions such as
 the native DeepSeek web_search tool.
 
+## Why Pi WSL MCP exists
+
+Pi works well in its WSL environment, but raw `wsl.exe` calls make ordinary
+agent work awkward: every caller must reconstruct the launch context, manage a
+child process, and invent its own way to find or continue a durable session.
+
+This project turns that workflow into a convenient local MCP entry point. An
+ordinary task becomes one tool call, saved work stays findable and reopenable
+across restarts, and live work has explicit wait, status, steer, and close
+controls. Pi still owns its runtime, extensions, transcripts, and model setup;
+direct Pi CLI use remains available for Pi-specific administration such as
+installing or removing extensions.
+
+## How it evolved
+
+The current bridge is the result of several deliberate changes rather than a
+thin shell wrapper:
+
+1. **Pi Local MCP — a protocol bridge first (July 2026).** The project began
+   as a local stdio bridge to Pi's supported JSONL RPC mode. It supported both
+   initialization-based clients and the stateless MCP `2026-07-28` protocol,
+   while keeping Pi sessions durable and provider-owned.
+2. **Answer-first results and correct run lifecycle (August 2026).** Compact
+   final answers became the default response, with diagnostics available only
+   on request. Reusable sessions, explicit wait/status/cancel controls, and
+   actionable model or empty-answer failures replaced ambiguous “settled”
+   states.
+3. **Pi WSL MCP — less ceremony in daily work (August 2026).** The
+   bridge was renamed and the Windows launcher stopped assuming one checkout,
+   workspace, WSL distribution, or absolute Pi binary path; it derives those
+   values from the caller and environment, so the default workspace follows
+   whatever project you open. It preserves consistent existing line endings
+   during Pi writes and keeps workspace selection scoped to configured roots.
+   Research and review stay read-only, so choosing the intended behavior is a
+   tool choice rather than a configuration exercise.
+4. **Native DeepSeek search and host-integration repair.** Native Responses
+   web search exposed a same-name collision with Pi's local `search` function.
+   Read-only profiles exclude that local function so native search can run
+   without the conflict. The host configuration also moved from the obsolete
+   `pi_local`/`run-pi-mcp.cmd` entry to
+   `pi_wsl`/`run-pi-wsl-mcp.cmd`.
+5. **Public source, unchanged package boundary.** The source is now published
+   under the MIT License. The package is still not published to npm; local
+   installation remains the supported distribution path for now.
+
+For the concrete configuration and naming migration, see
+[Migrating from Pi Local MCP](#migrating-from-pi-local-mcp).
+
 ## What it provides
 
 - A convenient pi_task entry point for ordinary workspace work.
-- Enforced read-only pi_research and pi_review workflows.
+- Read-only pi_research and pi_review for focused research and review.
 - Long-running task control: pi_send (including `behavior=steer`), pi_wait,
   pi_status, and pi_cancel.
 - Persistent Pi sessions: list, close, inspect history, and resume saved
@@ -397,9 +448,8 @@ Migrate configurations to the new names.
 
 Workspace arguments can be WSL paths such as `/home/<you>/projects/example` or
 Windows drive paths such as `D:\projects\example`. The bridge canonicalizes
-them and refuses paths outside `PI_WSL_MCP_ALLOWED_ROOTS` - the allowed-root
-containment boundary is retained, so explicit cross-project workspace
-selection works under configured roots:
+them and refuses paths outside `PI_WSL_MCP_ALLOWED_ROOTS`, so explicit
+cross-project workspace selection works under configured roots:
 
     PI_WSL_MCP_ALLOWED_ROOTS="/home/<you>/projects/example;/home/<you>/projects/other;/srv/team/project-x"
     PI_WSL_MCP_DEFAULT_CWD="/home/<you>/projects/example"
@@ -409,16 +459,15 @@ Then `pi_task`, `pi_start_session`, `pi_review`, and `pi_research` accept a
 `workspace` argument selecting any project under those roots, and everything
 else is refused with `workspace_not_allowed`.
 
-### Trusted workspaces
+### Allowed workspaces
 
-Trusted roots are exactly what the name says: a Pi task under an allowed
-root may read, edit, or run commands anywhere inside that root. List each
-trusted workspace **explicitly as its own root** - the project directory
-itself - and never a broad parent such as `$HOME`, `/home/<you>`, or a whole
-drive mount like `/mnt/d`. Trusting `/home/<you>/projects` would let any
-task reach every project under it, and trusting `/mnt/d` would reach
-everything on the drive; explicit roots keep the containment meaningful and
-make the trust boundary visible in configuration:
+Allowed roots are exactly what the name says: a Pi task under an allowed root
+may read, edit, or run commands anywhere inside that root. List each workspace
+**explicitly as its own root** - the project directory itself - and not a
+broad parent such as `$HOME`, `/home/<you>`, or a whole drive mount like
+`/mnt/d`: a broad root would make every project under it a selectable
+workspace. Explicit roots keep the workspace list predictable and visible in
+configuration:
 
     PI_WSL_MCP_ALLOWED_ROOTS="/home/<you>/projects/example;/home/<you>/projects/other;/srv/team/project-x"
 
