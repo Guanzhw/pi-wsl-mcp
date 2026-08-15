@@ -78,8 +78,8 @@ For the concrete configuration and naming migration, see
 - Pi model, thinking-level, compact, fork, and extension-command controls.
 - Delivery of genuinely interactive Pi extension requests through
   pi_respond_ui.
-- Bounded, redacted result payloads. Pi output, fetched pages, and transcript
-  content are always marked as untrusted.
+- Answer-first compact results with optional diagnostics and explicit
+  machine-readable operation/run state.
 
 ## Toolset: core and full
 
@@ -160,8 +160,14 @@ High-level calls (pi_task, pi_research, pi_review, pi_wait) return compact
 results by default. The final Pi text appears exactly once, in
 `content[0].text`, prefixed with an `untrusted` marker and followed by a very
 short status line plus session/run references; `structuredContent` carries no
-copy of the answer. Instead, `structuredContent.answer_meta` records machine
-facts about it (`has_answer`, `truncated`, `original_chars`), and
+copy of the answer. `structuredContent.success` reports whether the MCP
+operation itself succeeded, including successful directory/control calls that
+do not produce an answer; accepted operation errors keep their structured
+snapshot with `success: false` and `isError: true`, while plain rejected errors
+carry no structured content. A successful call can still report an errored or
+budget-exhausted Pi run, so callers must also inspect `result.run.status` and
+`result.run.error`. `structuredContent.answer_meta` records machine facts about
+the optional generated answer (`has_answer`, `truncated`, `original_chars`), and
 `structuredContent.result` carries the run summary needed to continue
 (session/run ids at the top level, status, error, timing, pending extension
 UI requests) without duplicating the assistant text or replaying tool/event
@@ -188,20 +194,23 @@ carry only session_id, lifecycle with an explicit `process_status` (the
 process state, kept separate from the run state in active_run), workspace,
 profile, created_at, pi_session_id, pi_session_name, active_run (run id and
 status, or null), and pending_ui_request_count; saved entries carry
-pi_session_id, workspace, created_at, and modified_at. Saved-session file
+pi_session_id, workspace, created_at, modified_at, and default-visible nullable
+`name` and `summary` identity fields. The name comes from Pi's session metadata;
+the summary is the first user-task preview. Both are redacted, collapsed to one
+line, and bounded to 160 Unicode code points plus an explicit ellipsis from a
+fixed-size session-file prefix. Assistant/tool output and saved-session file
 paths are never exposed, and saved byte sizes stay out of the default output.
 `include_details: true` restores the full diagnostic live summary (model,
 thinking level, streaming state, protocol warnings, pending UI requests, and
 the job snapshot with recent events) and adds saved-session byte sizes.
 `pi_status` remains the dedicated diagnostic view and keeps the detailed
-snapshot without duplicating tool calls inside the event stream. All returned
-Pi output and transcript content remains untrusted.
+snapshot without duplicating tool calls inside the event stream.
 
 ### Timeouts, continuation, and optional budgets
 
 pi_task/pi_review/pi_research accept `wait_seconds` and pi_wait accepts
 `timeout_seconds`; both stay schema-compatible through 300, but the actual
-blocking wait is capped at a configurable safety margin (default 285 seconds,
+blocking wait is capped at a configurable margin (default 285 seconds,
 `PI_WSL_MCP_MAX_WAIT_SECONDS`) so an expiring wait always returns to the
 client before Codex's tool_timeout_sec=300 kills the call. When a requested
 wait is clamped, the result carries `wait` metadata

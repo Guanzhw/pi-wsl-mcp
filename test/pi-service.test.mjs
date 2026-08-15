@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { PROFILES, PiService, actionableRunError, jobSnapshot, liveDirectoryEntry, savedDirectoryEntry, runProgress, runStats, usageFromMessage } from "../src/pi-service.mjs";
 
 function activeJob(overrides = {}) {
@@ -500,30 +503,45 @@ test("live directory entries are minimal and expose active_run only when a job e
   assert.equal(settled.active_run, null);
 });
 
-test("saved directory entries hide the session file and expose bytes only with details", () => {
+test("saved directory entries hide the session file, expose identity, and bytes only with details", () => {
   const saved = {
     pi_session_id: "pi-9",
     workspace: "/home/user/work",
     created_at: "2026-07-01T00:00:00.000Z",
     modified_at: "2026-07-02T00:00:00.000Z",
     bytes: 1234,
-    session_file: "/home/user/.pi/agent/sessions/pi-9.jsonl"
+    session_file: "/home/user/.pi/agent/sessions/pi-9.jsonl",
+    name: "Review pass",
+    summary: "Check the unstaged diff"
   };
   assert.deepEqual(savedDirectoryEntry(saved), {
     pi_session_id: "pi-9",
     workspace: "/home/user/work",
     created_at: "2026-07-01T00:00:00.000Z",
-    modified_at: "2026-07-02T00:00:00.000Z"
+    modified_at: "2026-07-02T00:00:00.000Z",
+    name: "Review pass",
+    summary: "Check the unstaged diff"
   });
   assert.deepEqual(savedDirectoryEntry(saved, true), {
     pi_session_id: "pi-9",
     workspace: "/home/user/work",
     created_at: "2026-07-01T00:00:00.000Z",
     modified_at: "2026-07-02T00:00:00.000Z",
+    name: "Review pass",
+    summary: "Check the unstaged diff",
     bytes: 1234
   });
   assert.equal(savedDirectoryEntry(saved, true).session_file, undefined);
   assert.equal(savedDirectoryEntry({ ...saved, bytes: undefined }, true).bytes, undefined);
+  // Sessions without derivable identity surface explicit nulls, never secrets.
+  assert.deepEqual(savedDirectoryEntry({ ...saved, name: undefined, summary: undefined }), {
+    pi_session_id: "pi-9",
+    workspace: "/home/user/work",
+    created_at: "2026-07-01T00:00:00.000Z",
+    modified_at: "2026-07-02T00:00:00.000Z",
+    name: null,
+    summary: null
+  });
 });
 
 test("session listing is a minimal directory unless details are requested", async () => {
@@ -546,7 +564,9 @@ test("session listing is a minimal directory unless details are requested", asyn
       workspace: "/home/user/work",
       created_at: "2026-07-01T00:00:00.000Z",
       modified_at: "2026-07-02T00:00:00.000Z",
-      bytes: 1234
+      bytes: 1234,
+      name: "Review pass",
+      summary: "Check the unstaged diff"
     }],
     liveSummary: (_session, options) => {
       calls.push(options);
@@ -574,7 +594,9 @@ test("session listing is a minimal directory unless details are requested", asyn
     pi_session_id: "pi-9",
     workspace: "/home/user/work",
     created_at: "2026-07-01T00:00:00.000Z",
-    modified_at: "2026-07-02T00:00:00.000Z"
+    modified_at: "2026-07-02T00:00:00.000Z",
+    name: "Review pass",
+    summary: "Check the unstaged diff"
   });
   assert.equal(compact.saved_sessions[0].bytes, undefined);
   assert.equal(compact.saved_sessions[0].session_file, undefined);
@@ -585,6 +607,182 @@ test("session listing is a minimal directory unless details are requested", asyn
   assert.deepEqual(calls, [{ includeDetails: true }]);
   assert.equal(detailed.saved_sessions[0].bytes, 1234);
   assert.equal(detailed.saved_sessions[0].session_file, undefined);
+});
+
+function sessionJsonl(lines) {
+  return lines.map((line) => JSON.stringify(line)).join("\n") + "\n";
+}
+
+function userMessage(text) {
+  return {
+    type: "message",
+    id: "entry-user",
+    parentId: "parent",
+    timestamp: "2026-07-01T00:00:01.000Z",
+    message: { role: "user", content: [{ type: "text", text }], timestamp: "2026-07-01T00:00:01.000Z" }
+  };
+}
+
+function sessionHeader(id, cwd, extra = {}) {
+  return { type: "session", id, cwd, timestamp: "2026-07-01T00:00:00.000Z", version: 1, ...extra };
+}
+
+test("scanSavedSessions derives bounded redacted identity from real session files", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-ident-"));
+  try {
+    // Defensive future shape: a name on the session header wins, preview follows.
+    await fs.writeFile(path.join(tmp, "a.jsonl"), sessionJsonl([
+      sessionHeader("pi-a", tmp, { name: "Fix auth bug" }),
+      userMessage("Review the diff of the auth module")
+    ]));
+    // Unnamed session: preview comes from the first user message, whitespace
+    // is collapsed, and later assistant output never leaks into it.
+    await fs.writeFile(path.join(tmp, "b.jsonl"), sessionJsonl([
+      sessionHeader("pi-b", tmp),
+      userMessage("  Implement   the focused   improvements.\n\nSecond line"),
+      { type: "message", id: "e2", parentId: "p", timestamp: "2026-07-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "CONFIDENTIAL assistant output" }], timestamp: "2026-07-01T00:00:02.000Z" } }
+    ]));
+    // Secrets inside the user message are redacted before surfacing.
+    await fs.writeFile(path.join(tmp, "c.jsonl"), sessionJsonl([
+      sessionHeader("pi-c", tmp),
+      userMessage("Use api_key=abc123secret to call the API and tell me everything")
+    ]));
+    // Corrupt file: skipped entirely.
+    await fs.writeFile(path.join(tmp, "d.jsonl"), "this is not a session jsonl\n");
+    // Concurrently-written/truncated trailing line: tolerated, identity kept.
+    await fs.writeFile(path.join(tmp, "e.jsonl"), sessionJsonl([
+      sessionHeader("pi-e", tmp),
+      userMessage("First real task")
+    ]) + "{\"type\":\"message\",\"id\":\"e2\",\"pa");
+    // Preview is capped at 160 chars plus an ellipsis.
+    await fs.writeFile(path.join(tmp, "g.jsonl"), sessionJsonl([
+      sessionHeader("pi-g", tmp),
+      userMessage("word ".repeat(100))
+    ]));
+    // User message beyond the bounded prefix: name kept, summary null.
+    await fs.writeFile(path.join(tmp, "f.jsonl"), sessionJsonl([
+      sessionHeader("pi-f", tmp, { name: "Big session" }),
+      { type: "message", id: "e1", parentId: "p", timestamp: "2026-07-01T00:00:01.000Z", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(400000) }], timestamp: "2026-07-01T00:00:01.000Z" } },
+      userMessage("way beyond the bounded prefix")
+    ]));
+    // Real Pi shape: the name lives in a session_info entry before the first
+    // user message; multiline names collapse to one line.
+    await fs.writeFile(path.join(tmp, "h.jsonl"), sessionJsonl([
+      sessionHeader("pi-h", tmp),
+      { type: "custom_message", id: "primer-h", customType: "primer", content: "ignored setup", display: false },
+      { type: "session_info", id: "info-h", name: "Auth\nrefactor  plan" },
+      userMessage("Review the auth changes")
+    ]));
+    // Real Pi shape: session_info AFTER the first user message still yields
+    // the name — the scan must not stop at the first user message.
+    await fs.writeFile(path.join(tmp, "i.jsonl"), sessionJsonl([
+      sessionHeader("pi-i", tmp),
+      userMessage("First task here"),
+      { type: "session_info", id: "info-i", name: "Late named task" }
+    ]));
+    // Multiple names within the prefix: the latest valid one wins.
+    await fs.writeFile(path.join(tmp, "j.jsonl"), sessionJsonl([
+      sessionHeader("pi-j", tmp),
+      { type: "session_info", id: "info-j1", name: "Early name" },
+      userMessage("Second task"),
+      { type: "session_info", id: "info-j2", name: "Late name" }
+    ]));
+    // Defensive shape: name nested under data.
+    await fs.writeFile(path.join(tmp, "k.jsonl"), sessionJsonl([
+      sessionHeader("pi-k", tmp),
+      { type: "session_info", id: "info-k", data: { name: "Nested name" } },
+      userMessage("Task k")
+    ]));
+    // Names are redacted and capped exactly like summaries.
+    await fs.writeFile(path.join(tmp, "l.jsonl"), sessionJsonl([
+      sessionHeader("pi-l", tmp),
+      { type: "session_info", id: "info-l", name: "Deploy with token=abc123secret " + "x".repeat(200) },
+      userMessage("Task l")
+    ]));
+    // Emoji exactly at the 160-code-point boundary: kept whole, no ellipsis.
+    await fs.writeFile(path.join(tmp, "m.jsonl"), sessionJsonl([
+      sessionHeader("pi-m", tmp),
+      userMessage("x".repeat(159) + "😀")
+    ]));
+    // Emoji straddling the truncation boundary: the pair is never split.
+    await fs.writeFile(path.join(tmp, "n.jsonl"), sessionJsonl([
+      sessionHeader("pi-n", tmp),
+      userMessage("x".repeat(160) + "😀")
+    ]));
+    // A valid-looking header after a corrupt first line must not be listed,
+    // because pi_resume_session also requires the real header on line one.
+    await fs.writeFile(path.join(tmp, "o.jsonl"), "corrupt prefix\n" + sessionJsonl([
+      sessionHeader("pi-o", tmp),
+      userMessage("must not be listed")
+    ]));
+
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      allowedRoots: [tmp],
+      config: { maxSavedSessions: 100 },
+      resolveSavedSessionWorkspace: async (cwd) => cwd
+    });
+    const result = await service.scanSavedSessions(tmp, 100);
+    const byId = Object.fromEntries(result.map((entry) => [entry.pi_session_id, entry]));
+    assert.equal(result.length, 13, "only the corrupt file must be skipped");
+    assert.equal(byId["pi-a"].name, "Fix auth bug");
+    assert.equal(byId["pi-a"].summary, "Review the diff of the auth module");
+    assert.equal(byId["pi-b"].name, null);
+    assert.equal(byId["pi-b"].summary, "Implement the focused improvements. Second line");
+    assert.ok(!byId["pi-b"].summary.includes("CONFIDENTIAL"), "assistant output must never leak into the preview");
+    assert.equal(byId["pi-c"].summary, "Use api_key=[redacted] to call the API and tell me everything");
+    assert.ok(!byId["pi-c"].summary.includes("abc123secret"), "secrets must be redacted from the preview");
+    assert.equal(byId["pi-e"].summary, "First real task", "a truncated trailing line must not hide earlier identity");
+    assert.equal(byId["pi-g"].summary.length, 161, "the preview must be capped at 160 chars plus ellipsis");
+    assert.ok(byId["pi-g"].summary.endsWith("…"));
+    assert.equal(byId["pi-f"].name, "Big session");
+    assert.equal(byId["pi-f"].summary, null, "no user message within the bounded prefix means no summary");
+    assert.equal(byId["pi-h"].name, "Auth refactor plan", "real session_info names are read and collapsed to one line");
+    assert.equal(byId["pi-h"].summary, "Review the auth changes");
+    assert.equal(byId["pi-i"].name, "Late named task", "a session_info after the first user message must still be found");
+    assert.equal(byId["pi-i"].summary, "First task here");
+    assert.equal(byId["pi-j"].name, "Late name", "the latest valid name within the prefix wins");
+    assert.equal(byId["pi-k"].name, "Nested name", "defensive data.name shapes are honored");
+    assert.ok(byId["pi-l"].name.startsWith("Deploy with token=[redacted] "), "name secrets must be redacted");
+    assert.ok(!byId["pi-l"].name.includes("abc123secret"), "name secrets must never surface");
+    assert.equal(Array.from(byId["pi-l"].name).length, 161, "names are capped at 160 code points plus ellipsis");
+    assert.ok(byId["pi-l"].name.endsWith("…"));
+    assert.equal(byId["pi-m"].summary, "x".repeat(159) + "😀", "an emoji at exactly 160 code points stays whole");
+    assert.equal(Array.from(byId["pi-m"].summary).length, 160);
+    assert.equal(byId["pi-n"].summary, "x".repeat(160) + "…", "truncation never splits a surrogate pair");
+    assert.ok(!/[\uD800-\uDFFF]/.test(byId["pi-n"].summary), "no lone surrogate halves may remain after truncation");
+    assert.equal(byId["pi-o"], undefined, "a later header must not make a corrupt file listable but unresumable");
+    for (const entry of result) {
+      assert.equal(entry.session_file, undefined, "the scanner must not expose file paths");
+      assert.ok(entry.bytes > 0);
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("scanSavedSessions filters by workspace and honors the limit", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-limit-"));
+  const other = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-other-"));
+  try {
+    await fs.writeFile(path.join(tmp, "in.jsonl"), sessionJsonl([sessionHeader("pi-in", tmp), userMessage("task in workspace")]));
+    await fs.writeFile(path.join(other, "out.jsonl"), sessionJsonl([sessionHeader("pi-out", other), userMessage("task outside")]));
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      allowedRoots: [tmp, other],
+      config: { maxSavedSessions: 100 },
+      resolveSavedSessionWorkspace: async (cwd) => cwd
+    });
+
+    const filtered = await service.scanSavedSessions(tmp, 100);
+    assert.deepEqual(filtered.map((entry) => entry.pi_session_id), ["pi-in"]);
+
+    const all = await service.scanSavedSessions(null, 1);
+    assert.equal(all.length, 1, "the limit must bound the directory listing");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+    await fs.rm(other, { recursive: true, force: true });
+  }
 });
 
 test("usageFromMessage extracts billed assistant usage and rejects synthetic empty usage", () => {

@@ -210,6 +210,11 @@ try {
   const payload = info.result?.structuredContent?.result;
   assert.ok(payload?.pi_bin?.endsWith("/pi"));
   assert.ok(Array.isArray(payload?.allowed_roots));
+  assert.equal(
+    info.result?.structuredContent?.success,
+    true,
+    "directory-style results succeed even though they carry no answer"
+  );
 
   if (process.argv.includes("--live")) {
     const research = await request("tools/call", {
@@ -281,6 +286,11 @@ try {
         arguments: { workspace: liveResult.session.workspace, limit: 100 }
       });
       assert.equal(listedSessions.error, undefined);
+      assert.equal(
+        listedSessions.result?.structuredContent?.success,
+        true,
+        "pi_sessions succeeds with has_answer=false"
+      );
       for (const entry of listedSessions.result?.structuredContent?.result?.live_sessions || []) {
         assert.equal(entry.job, undefined, "pi_sessions must be compact by default (no job snapshot).");
         assert.equal(entry.pi_session_file, undefined, "pi_sessions must not expose the session file by default.");
@@ -300,6 +310,16 @@ try {
         assert.equal(entry.bytes, undefined, "saved_sessions must not expose byte size by default.");
         assert.equal(typeof entry.pi_session_id, "string");
         assert.equal(typeof entry.modified_at, "string");
+        assert.ok("name" in entry, "saved_sessions must carry the derived session name field (nullable).");
+        assert.ok("summary" in entry, "saved_sessions must carry the bounded first-task preview field (nullable).");
+        if (entry.name !== null) {
+          assert.ok(Array.from(entry.name).length <= 161, "session name must stay bounded by Unicode code points.");
+          assert.ok(!entry.name.includes("\n"), "session name must be a single line.");
+        }
+        if (entry.summary !== null) {
+          assert.ok(Array.from(entry.summary).length <= 161, "preview must stay bounded by Unicode code points.");
+          assert.ok(!entry.summary.includes("\n"), "preview must be a single line.");
+        }
       }
       assert.ok(
         saved.some((entry) => entry.pi_session_id === liveResult.session.pi_session_id),
@@ -315,6 +335,13 @@ try {
       assert.ok(completed, "include_details must still discover the completed Pi session.");
       assert.equal(typeof completed.bytes, "number", "include_details must restore saved-session byte size.");
       assert.equal(completed.session_file, undefined, "include_details must still hide the session file path.");
+      assert.equal(
+        typeof completed.summary,
+        "string",
+        "the completed session must be identifiable by its bounded first-task preview."
+      );
+      assert.ok(completed.summary.length > 0, "the first-task preview must not be empty.");
+      assert.equal(detailedListed.result?.structuredContent?.success, true);
       const resumed = await request("tools/call", {
         name: "pi_resume_session",
         arguments: {

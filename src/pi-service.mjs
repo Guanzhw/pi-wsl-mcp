@@ -32,6 +32,10 @@ const MODEL_STATUS = new Set(["idle", "running", "stopped", "failed"]);
 const CLEANUP_STATUS = new Set(["pending", "running", "completed", "failed"]);
 const MAX_MODEL_BUCKETS = 8;
 const OTHER_MODEL_BUCKET = "__other__";
+// Saved-session identification stays bounded: a directory listing scans only
+// this prefix of each session file and never loads a whole transcript.
+const SESSION_PREVIEW_BYTES = 262144;
+const SESSION_PREVIEW_CHARS = 160;
 
 export const PROFILES = {
   workspace: {
@@ -389,20 +393,130 @@ export function liveDirectoryEntry(session) {
   };
 }
 
-// Minimal pi_sessions directory entry for a saved Pi session. The session file
-// path is never exposed; byte size is diagnostic and returned only when
-// includeDetails is set.
+// Minimal pi_sessions directory entry for a saved Pi session. Small
+// identification fields derived from a bounded prefix of the session file (a
+// redacted session name from a real session_info entry when one exists, plus
+// a redacted one-line first-task preview from the first user message) are
+// always visible so several sessions from one workspace stay distinguishable.
+// The session file path is never exposed; byte size is diagnostic and
+// returned only when includeDetails is set.
 export function savedDirectoryEntry(saved, includeDetails = false) {
   const entry = {
     pi_session_id: saved.pi_session_id,
     workspace: saved.workspace,
     created_at: saved.created_at,
-    modified_at: saved.modified_at
+    modified_at: saved.modified_at,
+    name: saved.name || null,
+    summary: saved.summary || null
   };
   if (includeDetails && typeof saved.bytes === "number") {
     entry.bytes = saved.bytes;
   }
   return entry;
+}
+
+// Shared saved-session identity sanitizer: secrets are redacted, whitespace is
+// collapsed to a single line, the result is trimmed, and the length is capped
+// at SESSION_PREVIEW_CHARS Unicode code points (surrogate pairs are never
+// split) with an explicit ellipsis. Applied to both the session name and the
+// first-task preview so every surfaced identity field stays compact and one
+// line.
+function identityText(text) {
+  const collapsed = redactText(text).replace(/\s+/g, " ").trim();
+  const points = Array.from(collapsed);
+  return points.length > SESSION_PREVIEW_CHARS
+    ? points.slice(0, SESSION_PREVIEW_CHARS).join("") + "…"
+    : collapsed;
+}
+
+// Bounded, redacted first-task preview from a user message: the first text
+// block, run through identityText. Returns null when the message carries no
+// usable text. Only user text is ever surfaced — never assistant or tool
+// output.
+function previewText(message) {
+  const content = message?.content;
+  let text = null;
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && typeof block.text === "string" && block.text.trim()) {
+        text = block.text;
+        break;
+      }
+    }
+  }
+  if (!text) {
+    return null;
+  }
+  return identityText(text) || null;
+}
+
+// A session name from any accepted entry shape: the real Pi session_info entry
+// ({type:"session_info", name}), a defensive nested data.name, and a future
+// name on the session header itself ({type:"session", name}). Sanitized with
+// identityText; null when absent or empty after sanitizing.
+function sessionName(entry) {
+  if (!entry || typeof entry !== "object" || (entry.type !== "session" && entry.type !== "session_info")) {
+    return null;
+  }
+  let raw = typeof entry.name === "string" ? entry.name : null;
+  if (raw === null && entry.data && typeof entry.data === "object" && typeof entry.data.name === "string") {
+    raw = entry.data.name;
+  }
+  if (raw === null) {
+    return null;
+  }
+  return identityText(raw) || null;
+}
+
+// Small saved-session header plus identity from ONE bounded prefix read
+// of the JSONL file: the required first-line session header, an explicit Pi session
+// name when any session_info/header entry carries one (the latest within the
+// prefix wins, whether it occurs before or after the first user message), and
+// a short first-task preview from the first user message. Only
+// SESSION_PREVIEW_BYTES are read, so listings stay fast; malformed, truncated,
+// or concurrently written lines are skipped. File paths, tool output,
+// assistant output, and unbounded transcript text never enter the identity.
+async function readSessionPrefix(file) {
+  const handle = await fs.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(SESSION_PREVIEW_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, SESSION_PREVIEW_BYTES, 0);
+    const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
+    const identity = { name: null, summary: null };
+    let header;
+    try {
+      header = JSON.parse((lines[0] || "").replace(/\r$/, ""));
+    } catch (error) {
+      return { header: null, identity };
+    }
+    if (header?.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string") {
+      return { header: null, identity };
+    }
+    for (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch (error) {
+        // A truncated or corrupt line must not hide the rest of the prefix.
+        continue;
+      }
+      const name = sessionName(entry);
+      if (name !== null) {
+        identity.name = name;
+      }
+      if (identity.summary === null && entry?.type === "message" && entry.message?.role === "user") {
+        identity.summary = previewText(entry.message);
+      }
+    }
+    return { header, identity };
+  } finally {
+    await handle.close();
+  }
 }
 
 // Directly reusable pi_wait/pi_status arguments for continuation after any
@@ -1381,19 +1495,24 @@ export class PiService {
     };
   }
 
+  async resolveSavedSessionWorkspace(cwd) {
+    return canonicalDirectory(cwd, this.allowedRoots, "saved Pi session workspace");
+  }
+
   async scanSavedSessions(workspace, limit) {
     const fileCandidates = await this.walkSessionFiles(Math.max(limit * 4, 300));
     const inspected = [];
     for (const candidate of fileCandidates) {
       try {
-        const headerLine = await readFirstLine(candidate.file);
-        const header = JSON.parse(headerLine);
-        if (header?.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string") {
+        // One bounded prefix read per candidate yields both the validated
+        // header and the small identity (name/summary) fields.
+        const { header, identity } = await readSessionPrefix(candidate.file);
+        if (!header) {
           continue;
         }
         let sessionWorkspace;
         try {
-          sessionWorkspace = await canonicalDirectory(header.cwd, this.allowedRoots, "saved Pi session workspace");
+          sessionWorkspace = await this.resolveSavedSessionWorkspace(header.cwd);
         } catch (error) {
           continue;
         }
@@ -1406,7 +1525,9 @@ export class PiService {
           created_at: typeof header.timestamp === "string" ? header.timestamp : candidate.modified_at,
           modified_at: candidate.modified_at,
           bytes: candidate.bytes,
-          session_file: candidate.file
+          session_file: candidate.file,
+          name: identity.name,
+          summary: identity.summary
         });
       } catch (error) {
         // A corrupt or concurrently-written session must not prevent listing the rest.
@@ -1427,7 +1548,7 @@ export class PiService {
         if (header?.type !== "session" || header.id !== piSessionId || typeof header.cwd !== "string") {
           continue;
         }
-        const workspace = await canonicalDirectory(header.cwd, this.allowedRoots, "saved Pi session workspace");
+        const workspace = await this.resolveSavedSessionWorkspace(header.cwd);
         const sessionFile = await canonicalFileWithin(candidate.file, this.sessionRoot, "saved Pi session");
         return {
           pi_session_id: header.id,

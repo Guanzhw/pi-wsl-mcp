@@ -60,6 +60,7 @@ function assertAnswerFirst(result, answer) {
     truncated: false,
     original_chars: answer.length
   });
+  assert.equal(result.structuredContent?.success, true, "answer-first results are structured successes");
   assert.equal(result.structuredContent?.answer, undefined);
   assert.equal(result.structuredContent?.result?.answer, undefined);
   assert.equal(result.structuredContent?.result?.run?.result, undefined);
@@ -117,6 +118,7 @@ test("high-level task summaries distinguish a requested wait timeout", async () 
       arguments: { message: "Continue the task.", wait_seconds: 30 }
     });
     assert.equal(result.structuredContent?.answer_meta?.has_answer, false);
+    assert.equal(result.structuredContent?.success, true, "a requested-wait timeout is still a structured success");
     assert.equal(result.structuredContent?.answer_meta?.truncated, false);
     assert.equal(result.structuredContent?.answer_meta?.original_chars, 0);
     const payload = result.structuredContent?.result;
@@ -280,6 +282,7 @@ test("accepted run failures preserve ids and continuation in error results", asy
       arguments: { message: "go", wait_seconds: 0 }
     });
     assert.equal(result.isError, true);
+    assert.equal(result.structuredContent?.success, false, "an accepted run that later failed is a failed operation (success=false, isError=true)");
     assert.equal(result.structuredContent?.answer_meta?.has_answer, false);
     const { answer, ...expectedResult } = acceptedResult;
     assert.deepEqual(result.structuredContent?.result, expectedResult);
@@ -566,7 +569,9 @@ test("pi_sessions lists a minimal session directory and include_details restores
         pi_session_id: "pi-9",
         workspace: "/home/user/work",
         created_at: "2026-07-01T00:00:00.000Z",
-        modified_at: "2026-07-02T00:00:00.000Z"
+        modified_at: "2026-07-02T00:00:00.000Z",
+        name: "Review pass",
+        summary: "Check the unstaged diff"
       }];
       if (input.include_details) {
         live.job = {
@@ -599,10 +604,17 @@ test("pi_sessions lists a minimal session directory and include_details restores
       pi_session_id: "pi-9",
       workspace: "/home/user/work",
       created_at: "2026-07-01T00:00:00.000Z",
-      modified_at: "2026-07-02T00:00:00.000Z"
+      modified_at: "2026-07-02T00:00:00.000Z",
+      name: "Review pass",
+      summary: "Check the unstaged diff"
     });
     assert.equal(compactSaved.bytes, undefined);
     assert.equal(compactSaved.session_file, undefined);
+    assert.equal(
+      compact.structuredContent?.success,
+      true,
+      "pi_sessions succeeds even though its directory result has no answer"
+    );
     assert.ok(!calls[0].include_details);
 
     const detailed = await client.callTool({
@@ -674,6 +686,7 @@ test("error results carry answer_meta with no answer and keep the accepted snaps
       arguments: { message: "go", wait_seconds: 0 }
     });
     assert.equal(result.isError, true);
+    assert.equal(result.structuredContent?.success, false, "accepted structured errors must not claim success");
     assert.deepEqual(result.structuredContent?.answer_meta, {
       has_answer: false,
       truncated: false,
@@ -681,6 +694,23 @@ test("error results carry answer_meta with no answer and keep the accepted snaps
     });
     assert.equal(result.structuredContent?.answer, undefined);
     assert.equal(result.structuredContent?.result?.run?.status, "error");
+  });
+});
+
+test("plain rejected errors stay isError-only and never carry a structured success", async () => {
+  const service = {
+    status: async () => {
+      throw new PiWslError("unknown_session", "No live Pi session exists with id missing.");
+    }
+  };
+  await withClient(service, async (client) => {
+    const result = await client.callTool({
+      name: "pi_status",
+      arguments: { session_id: "missing" }
+    });
+    assert.equal(result.isError, true, "unaccepted rejections keep isError semantics");
+    assert.equal(result.structuredContent, undefined, "plain errors carry no success signal");
+    assert.match(result.content?.[0]?.text || "", /unknown_session/);
   });
 });
 
@@ -730,7 +760,22 @@ test("the default core toolset registers exactly the daily-agent workflow tools"
       assert.ok(!tools.tools.some((tool) => tool.name === name), "core must not register " + name);
     }
     const instructions = client.getInstructions() || "";
+    // Compact, journey-first instructions: the fastest routes come first and
+    // the core/full boundary stays truthful without enumerating tools.
+    assert.ok(instructions.length < 460, "core instructions must stay compact (" + instructions.length + " chars)");
     assert.match(instructions, /Core toolset \(PI_WSL_MCP_TOOLSET=core\)/);
+    assert.match(instructions, /pi_task: one-call workspace work/);
+    assert.match(instructions, /pi_research\/pi_review: read-only work/);
+    assert.match(instructions, /pi_send: prompt or steer live work/);
+    assert.match(instructions, /pi_wait\/pi_status: follow a run/);
+    assert.match(instructions, /pi_sessions\/pi_resume_session: find or reopen saved work/);
+    assert.match(instructions, /pi_close_session: free a live slot/);
+    const coreOrder = ["pi_task", "pi_research", "pi_send", "pi_wait", "pi_sessions", "pi_close_session"];
+    assert.ok(
+      coreOrder.every((name, i) => i === 0 || instructions.indexOf(name) > instructions.indexOf(coreOrder[i - 1])),
+      "core instructions must lead with the fastest user journeys in order"
+    );
+    assert.match(instructions, /Use full for cancel, history, models, UI responses, compact, fork, and commands/, "core instructions must keep the full-only boundary useful");
     assert.ok(!instructions.includes("pi_history"), "core instructions must not advertise full-only tools");
   }, { injectToolset: false });
 });
@@ -740,6 +785,8 @@ test("the full toolset registers all 20 tools with their current names and core 
     const names = (await client.listTools()).tools.map((tool) => tool.name);
     assert.equal(names.length, CORE_TOOLSET_TOOLS.length);
     assert.match(client.getInstructions() || "", /Core toolset/);
+    const coreInstructions = client.getInstructions() || "";
+    assert.ok(coreInstructions.length < 460, "core instructions must stay compact");
     return names;
   }, { toolset: "core" });
 
@@ -750,7 +797,21 @@ test("the full toolset registers all 20 tools with their current names and core 
     for (const name of [...CORE_TOOLSET_TOOLS, ...FULL_ONLY_TOOLS]) {
       assert.ok(names.includes(name), "full must register " + name);
     }
-    assert.match(client.getInstructions() || "", /Use pi_research or pi_review for enforced read-only work\./);
+    const fullInstructions = client.getInstructions() || "";
+    assert.ok(fullInstructions.length < 340, "full instructions must stay compact (" + fullInstructions.length + " chars)");
+    assert.match(fullInstructions, /pi_task: one-call workspace work/);
+    assert.match(fullInstructions, /pi_research\/pi_review: read-only work/);
+    assert.match(fullInstructions, /pi_send: prompt or steer live work/);
+    assert.match(fullInstructions, /pi_wait\/pi_status: follow a run/);
+    assert.match(fullInstructions, /pi_sessions\/pi_resume_session: find or reopen saved work/);
+    assert.match(fullInstructions, /pi_close_session: free a live slot/);
+    assert.match(fullInstructions, /Full also provides cancel, history, models, UI responses, compact, fork, and commands/);
+    const fullOrder = ["pi_task", "pi_research", "pi_send", "pi_wait", "pi_sessions", "pi_close_session"];
+    assert.ok(
+      fullOrder.every((name, i) => i === 0 || fullInstructions.indexOf(name) > fullInstructions.indexOf(fullOrder[i - 1])),
+      "full instructions must lead with the fastest user journeys in order"
+    );
+    assert.ok(!fullInstructions.includes("PI_WSL_MCP_TOOLSET"), "full instructions must not reference core-only env configuration");
     return names;
   });
 
@@ -798,6 +859,7 @@ test("budget-exhausted runs without a final answer say so and keep the structure
       arguments: { message: "go", wait_seconds: 30, max_model_calls: 5 }
     });
     assert.equal(result.isError, undefined);
+    assert.equal(result.structuredContent?.success, true, "a budget-exhausted structured result is still a successful call");
     assert.deepEqual(result.structuredContent?.answer_meta, {
       has_answer: false,
       truncated: false,
