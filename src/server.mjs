@@ -22,6 +22,7 @@ const toolOutputSchema = z.object({
 
 const sessionIdSchema = z.string().trim().min(1).max(200);
 const workspaceSchema = z.string().trim().min(1).max(4000);
+const SAVED_CURSOR_MAX_CHARS = 24000;
 const profileSchema = z.enum(["workspace", "review", "research"]);
 const thinkingSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const startOptionsSchema = z.object({
@@ -145,7 +146,17 @@ function success(summary, result, limit) {
   // The answer is bounded and redacted independently of the snapshot so the
   // compact default never duplicates the full assistant text in the result.
   const bound = boundAnswer(extractAnswer(result), limit);
-  const safe = boundedValue(stripAnswerChannel(result), { maxDepth: 12, maxItems: 160, maxString: limit });
+  const stripped = stripAnswerChannel(result);
+  const safe = boundedValue(stripped, { maxDepth: 12, maxItems: 160, maxString: limit });
+  // Pagination cursors are control data, not transcript/diagnostic content.
+  // Preserve a service-generated cursor even when RESULT_LIMIT is configured
+  // below its length; otherwise a valid first page could return a truncated,
+  // unusable continuation. The MCP input schema enforces the same hard cap.
+  if (safe && typeof safe === "object" &&
+      typeof stripped?.next_saved_cursor === "string" &&
+      stripped.next_saved_cursor.length <= SAVED_CURSOR_MAX_CHARS) {
+    safe.next_saved_cursor = stripped.next_saved_cursor;
+  }
   return {
     content: [{
       type: "text",
@@ -543,22 +554,32 @@ export function createPiMcpServer(service) {
 
   registerTool("pi_sessions", {
     title: "List live and saved Pi sessions",
-    description: "Find live and saved Pi sessions. Saved entries include a name and first-task preview when available, so similar sessions are easy to distinguish. Pass a saved id to pi_resume_session; use include_details for live diagnostics and saved byte sizes.",
+    description: "List live sessions and all local saved Pi sessions, newest first, including outside the configured allowed roots or after a workspace disappears. Pass next_saved_cursor back as saved_cursor; it preserves the filter and page size. workspace filters recorded metadata only. Use pi_resume_session to reopen saved work; include_details adds diagnostics and byte sizes.",
     inputSchema: z.object({
       workspace: workspaceSchema.optional(),
       limit: z.number().int().min(1).max(500).optional(),
+      // The cursor carries the normalized workspace filter so cursor-only
+      // continuation can reproduce the query. workspace accepts up to 4000
+      // characters (including Unicode), so leave enough room for JSON plus
+      // base64url expansion.
+      saved_cursor: z.string().trim().min(1).max(SAVED_CURSOR_MAX_CHARS).optional(),
       include_details: z.boolean().optional()
     }).strict(),
     outputSchema: toolOutputSchema,
     annotations: readOnly
   }, (input) => call(
     () => service.listSessions(input),
-    (result) => "Found " + result.live_sessions.length + " live and " + result.saved_sessions.length + " saved Pi session(s)."
+    (result) => {
+      const summary = "Found " + result.live_sessions.length + " live and " + result.saved_sessions.length + " saved Pi session(s).";
+      return result.next_saved_cursor
+        ? summary + " Pass next_saved_cursor back as saved_cursor for the next page."
+        : summary;
+    }
   ));
 
   registerTool("pi_resume_session", {
     title: "Resume a saved Pi session",
-    description: "Reopen a saved session returned by pi_sessions with its original workspace and transcript. Optionally choose the profile, model, thinking level, or live-session name.",
+    description: "Reopen a local saved session by pi_session_id in its recorded workspace, including outside the configured allowed roots. The directory must still exist on disk. Use pi_task/pi_start_session to start new work elsewhere; optional profile/model/thinking/name configure the live process.",
     inputSchema: z.object({
       saved_session_id: sessionIdSchema,
       profile: profileSchema.optional(),

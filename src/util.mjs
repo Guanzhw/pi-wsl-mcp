@@ -112,6 +112,31 @@ export async function canonicalDirectory(input, roots, label = "workspace") {
   return canonical;
 }
 
+// Canonicalize a directory that must exist and be a directory, WITHOUT
+// restricting it to any allowed roots. This is deliberately separate from
+// canonicalDirectory: resume-by-local-session-id uses Pi's recorded workspace,
+// while configured roots continue to govern caller-selected workspaces for new
+// sessions. The recorded workspace must still exist.
+export async function canonicalExistingDirectory(input, label = "workspace") {
+  const normalized = normalizeWslPath(input, label);
+  let canonical;
+  try {
+    canonical = await fs.realpath(normalized);
+  } catch (error) {
+    throw new PiWslError("workspace_not_found", label + " does not exist: " + normalized);
+  }
+  let stat;
+  try {
+    stat = await fs.stat(canonical);
+  } catch (error) {
+    throw new PiWslError("workspace_not_found", label + " cannot be inspected: " + normalized);
+  }
+  if (!stat.isDirectory()) {
+    throw new PiWslError("invalid_workspace", label + " must be a directory.");
+  }
+  return canonical;
+}
+
 export async function canonicalRoots(inputs) {
   const roots = [];
   for (const input of inputs) {

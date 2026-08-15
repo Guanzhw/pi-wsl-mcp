@@ -551,6 +551,7 @@ test("reuse conflicts surface as tool errors with the service code", async () =>
 test("pi_sessions lists a minimal session directory and include_details restores diagnostics", async () => {
   const calls = [];
   const service = {
+    config: { resultLimit: 2000 },
     listSessions: async (input) => {
       calls.push(input);
       const live = {
@@ -583,7 +584,8 @@ test("pi_sessions lists a minimal session directory and include_details restores
       }
       return {
         live_sessions: [live],
-        saved_sessions: saved
+        saved_sessions: saved,
+        next_saved_cursor: input.saved_cursor ? "cursor-after-" + input.saved_cursor : null
       };
     }
   };
@@ -610,6 +612,7 @@ test("pi_sessions lists a minimal session directory and include_details restores
     });
     assert.equal(compactSaved.bytes, undefined);
     assert.equal(compactSaved.session_file, undefined);
+    assert.equal(compact.structuredContent?.result?.next_saved_cursor, null, "the final page reports no continuation cursor");
     assert.equal(
       compact.structuredContent?.success,
       true,
@@ -627,6 +630,55 @@ test("pi_sessions lists a minimal session directory and include_details restores
     assert.equal(detailed.structuredContent?.result?.saved_sessions?.[0]?.bytes, 1234);
     assert.equal(detailed.structuredContent?.result?.saved_sessions?.[0]?.session_file, undefined);
     assert.ok(calls[1].include_details);
+
+    const continued = await client.callTool({
+      name: "pi_sessions",
+      arguments: { saved_cursor: "cursor-1" }
+    });
+    assert.equal(calls[2].saved_cursor, "cursor-1", "saved_cursor must reach the service");
+    assert.equal(
+      continued.structuredContent?.result?.next_saved_cursor,
+      "cursor-after-cursor-1",
+      "the returned next_saved_cursor must pass through for continuation"
+    );
+
+    const longCursor = "x".repeat(6000);
+    const longContinuation = await client.callTool({
+      name: "pi_sessions",
+      arguments: { saved_cursor: longCursor }
+    });
+    assert.equal(calls[3].saved_cursor, longCursor, "workspace-bearing cursors longer than the old 400-char bound must reach the service");
+    assert.equal(
+      longContinuation.structuredContent?.result?.next_saved_cursor,
+      "cursor-after-" + longCursor,
+      "pagination control data must survive a smaller PI_WSL_MCP_RESULT_LIMIT intact"
+    );
+  });
+});
+
+test("pi_sessions/pi_resume_session document all-saved-session scope, cursor continuation, and resume-by-id", async () => {
+  await withClient({
+    listSessions: async () => ({ live_sessions: [], saved_sessions: [], next_saved_cursor: null })
+  }, async (client) => {
+    const tools = (await client.listTools()).tools;
+    const sessionsTool = tools.find((tool) => tool.name === "pi_sessions");
+    const resumeTool = tools.find((tool) => tool.name === "pi_resume_session");
+    const sessionsDescription = sessionsTool?.description || "";
+    assert.match(sessionsDescription, /all local saved Pi sessions/i, "pi_sessions must advertise the full local store");
+    assert.match(sessionsDescription, /next_saved_cursor/);
+    assert.match(sessionsDescription, /saved_cursor/);
+    assert.match(sessionsDescription, /outside the configured allowed roots/i, "saved sessions must not be claimed as root-filtered");
+    assert.ok(!/filtered by.*allowed root/i.test(sessionsDescription), "no wording may claim saved sessions are filtered by allowed roots");
+    assert.match(sessionsDescription, /resume_session/i, "pi_sessions must point to resume-by-local-id");
+    const resumeDescription = resumeTool?.description || "";
+    assert.match(resumeDescription, /pi_session_id/);
+    assert.match(resumeDescription, /recorded workspace/);
+    assert.match(resumeDescription, /outside the configured allowed roots/i, "resume must document outside-root workspaces");
+    assert.match(resumeDescription, /must still exist on disk/);
+    assert.match(resumeDescription, /start new work/i, "resume must be distinguished from new-workspace selection");
+    const sessionsSchema = JSON.stringify(sessionsTool?.inputSchema || {});
+    assert.ok(sessionsSchema.includes('"saved_cursor"'), "pi_sessions must accept saved_cursor");
+    assert.equal(sessionsTool?.inputSchema?.properties?.saved_cursor?.maxLength, 24000, "saved_cursor must fit a maximum-length workspace filter after encoding");
   });
 });
 

@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   boundedValue,
   canonicalDirectory,
+  canonicalExistingDirectory,
   canonicalFileWithin,
   canonicalRoots,
   createConfig,
@@ -36,6 +37,11 @@ const OTHER_MODEL_BUCKET = "__other__";
 // this prefix of each session file and never loads a whole transcript.
 const SESSION_PREVIEW_BYTES = 262144;
 const SESSION_PREVIEW_CHARS = 160;
+// Saved-session listing pages are capped well below the server's bounded
+// array limit (boundedValue maxItems=160), so a structured page is never
+// silently truncated; continuation via saved_cursor reaches every saved
+// session beyond the first page.
+const MAX_SAVED_PAGE_SIZE = 100;
 
 export const PROFILES = {
   workspace: {
@@ -475,9 +481,11 @@ function sessionName(entry) {
 // name when any session_info/header entry carries one (the latest within the
 // prefix wins, whether it occurs before or after the first user message), and
 // a short first-task preview from the first user message. Only
-// SESSION_PREVIEW_BYTES are read, so listings stay fast; malformed, truncated,
-// or concurrently written lines are skipped. File paths, tool output,
-// assistant output, and unbounded transcript text never enter the identity.
+// SESSION_PREVIEW_BYTES are read; scanSavedSessions calls this only for
+// entries actually returned on a page (discovery itself is first-line-only),
+// so listings stay fast. Malformed, truncated, or concurrently written lines
+// are skipped. File paths, tool output, assistant output, and unbounded
+// transcript text never enter the identity.
 async function readSessionPrefix(file) {
   const handle = await fs.open(file, "r");
   try {
@@ -517,6 +525,49 @@ async function readSessionPrefix(file) {
   } finally {
     await handle.close();
   }
+}
+
+// Opaque, versioned saved-session pagination cursor. base64url is only a
+// compact transport encoding: it provides NO authenticity or integrity, and
+// nothing here treats it as such. Clients must treat the cursor as an opaque
+// string; decodeSavedCursor validates shape and scope only (version, offset,
+// normalized workspace filter, effective page size) so that anything not
+// produced by pi_sessions in the current shape is rejected with an actionable
+// error instead of being silently interpreted. The cursor is SELF-CONTAINED:
+// it also encodes the normalized workspace filter (or null) and the effective
+// page size, so a continuation call needs no repeated workspace or limit. The
+// offset counts the newest-first positions of VALID saved session headers
+// only, so corrupt or concurrently written files never consume cursor
+// positions.
+function encodeSavedCursor(offset, workspace, pageSize) {
+  return Buffer.from(JSON.stringify({ v: 2, o: offset, w: workspace, p: pageSize })).toString("base64url");
+}
+
+function decodeSavedCursor(cursor) {
+  if (typeof cursor !== "string" || cursor.trim() === "") {
+    return null;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+  } catch (error) {
+    throw new PiWslError("invalid_saved_cursor", "saved_cursor must be an opaque cursor returned by pi_sessions.");
+  }
+  let validWorkspace = payload?.w === null;
+  if (typeof payload?.w === "string" && payload.w.length <= 4000) {
+    try {
+      validWorkspace = normalizeWslPath(payload.w, "saved cursor workspace") === payload.w;
+    } catch (error) {
+      validWorkspace = false;
+    }
+  }
+  if (payload?.v !== 2 ||
+      !Number.isSafeInteger(payload.o) || payload.o < 0 ||
+      !validWorkspace ||
+      !Number.isInteger(payload.p) || payload.p < 1 || payload.p > MAX_SAVED_PAGE_SIZE) {
+    throw new PiWslError("invalid_saved_cursor", "saved_cursor must be an opaque cursor returned by pi_sessions.");
+  }
+  return { offset: payload.o, workspace: payload.w, pageSize: payload.p };
 }
 
 // Directly reusable pi_wait/pi_status arguments for continuation after any
@@ -1001,14 +1052,18 @@ export class PiService {
     this.autoCloseIfSettled(session);
   }
 
-  async startSession(input = {}) {
+  async startSession(input = {}, internal = {}) {
     if (activeProcessCount(this.sessions) >= this.config.maxSessions) {
       throw new PiWslError(
         "session_limit_reached",
         "The Pi WSL MCP has reached its " + this.config.maxSessions + " live-session limit. Close a session before starting another."
       );
     }
-    const workspace = await this.resolveWorkspace(input.workspace);
+    // internal.workspace is a pre-canonicalized directory that bypasses
+    // resolveWorkspace (including the allowed-roots check). It is used ONLY
+    // by resume(), which reopens a saved session's recorded workspace; no MCP
+    // tool can reach it with caller-controlled input.
+    const workspace = internal.workspace ?? await this.resolveWorkspace(input.workspace);
     const profile = profileFor(input.profile);
     const rpc = new PiRpcProcess({
       piBin: this.config.piBin,
@@ -1461,30 +1516,70 @@ export class PiService {
   }
 
   async listSessions(input = {}) {
-    const workspace = input.workspace ? await this.resolveWorkspace(input.workspace) : null;
-    const limit = input.limit || this.config.maxSavedSessions;
-    const saved = await this.scanSavedSessions(workspace, limit);
+    // The workspace filter is pure metadata: it accepts any absolute WSL or
+    // Windows drive path and is compared against the recorded workspace
+    // string of live and saved sessions. No allowed-root or existence checks
+    // run, so filtering by a workspace outside the configured roots (or one
+    // that is temporarily unavailable) still works.
+    const cursor = input.saved_cursor !== undefined ? decodeSavedCursor(input.saved_cursor) : null;
+    let workspace = input.workspace ? normalizeWslPath(input.workspace, "workspace") : null;
+    let pageSize;
+    let offset = 0;
+    if (cursor === null) {
+      const requested = input.limit || this.config.maxSavedSessions;
+      pageSize = Math.min(requested, MAX_SAVED_PAGE_SIZE);
+    } else {
+      // Cursor-only continuation must reproduce the original listing exactly;
+      // caller-supplied workspace/limit are accepted only when they normalize
+      // to the cursor's own scope and page size.
+      offset = cursor.offset;
+      if (input.workspace) {
+        if (workspace !== cursor.workspace) {
+          throw new PiWslError(
+            "invalid_saved_cursor",
+            "saved_cursor was produced for a different workspace filter. Start a new listing by calling pi_sessions without saved_cursor instead."
+          );
+        }
+      } else {
+        workspace = cursor.workspace;
+      }
+      if (input.limit !== undefined) {
+        const effective = Math.min(input.limit, MAX_SAVED_PAGE_SIZE);
+        if (effective !== cursor.pageSize) {
+          throw new PiWslError(
+            "invalid_saved_cursor",
+            "saved_cursor was produced for a different page size. Start a new listing by calling pi_sessions without saved_cursor instead."
+          );
+        }
+        pageSize = effective;
+      } else {
+        pageSize = cursor.pageSize;
+      }
+    }
+    const { entries, next_offset: nextOffset } = await this.scanSavedSessions(workspace, pageSize, offset);
     return {
-      live_sessions: Array.from(this.sessions.values()).map((session) =>
-        input.include_details
-          ? this.liveSummary(session, { includeDetails: true })
-          : liveDirectoryEntry(session)
-      ),
-      saved_sessions: saved.map((entry) => savedDirectoryEntry(entry, input.include_details))
+      live_sessions: Array.from(this.sessions.values())
+        .filter((session) => workspace === null || normalizeWslPath(session.workspace, "workspace") === workspace)
+        .map((session) =>
+          input.include_details
+            ? this.liveSummary(session, { includeDetails: true })
+            : liveDirectoryEntry(session)
+        ),
+      saved_sessions: entries.map((entry) => savedDirectoryEntry(entry, input.include_details)),
+      next_saved_cursor: nextOffset === null ? null : encodeSavedCursor(nextOffset, workspace, pageSize)
     };
   }
 
   async resume(input) {
     const saved = await this.findSavedSession(input.saved_session_id);
     const started = await this.startSession({
-      workspace: saved.workspace,
       profile: input.profile || "workspace",
       sessionPath: saved.session_file,
       provider: input.provider,
       model: input.model,
       thinking: input.thinking,
       name: input.name
-    });
+    }, { workspace: saved.workspace });
     return {
       resumed_from: {
         saved_session_id: saved.pi_session_id,
@@ -1495,89 +1590,203 @@ export class PiService {
     };
   }
 
-  async resolveSavedSessionWorkspace(cwd) {
-    return canonicalDirectory(cwd, this.allowedRoots, "saved Pi session workspace");
-  }
-
-  async scanSavedSessions(workspace, limit) {
-    const fileCandidates = await this.walkSessionFiles(Math.max(limit * 4, 300));
+  // The recorded workspace of a saved session is normalized lexically as pure
+  // metadata: NO allowed-root or existence checks. Discovery (pi_sessions)
+  // must list every valid saved session in the store, including sessions
+  // recorded in workspaces outside the configured roots, workspaces that no
+  // longer exist, or workspaces that are temporarily unavailable. The
+  // workspace is validated only when the user explicitly resumes the session.
+  //
+  // Scanning is two-phase so listings stay fast: every candidate gets ONE small
+  // bounded first-line read that validates the header and consumes a pagination
+  // position (corrupt files never consume positions); the bounded 256KiB
+  // identity prefix (name/summary) is read only for entries actually returned
+  // on the current page. The one extra valid header beyond the page (used to
+  // prove more sessions remain) is also first-line-only.
+  async scanSavedSessions(workspace, pageSize, offset = 0) {
+    const fileCandidates = await this.walkSessionFiles();
     const inspected = [];
     for (const candidate of fileCandidates) {
+      // Phase 1: validate the first-line session header with a small bounded
+      // read and count the position. The workspace filter applies here, so
+      // filtered-out sessions never consume page slots or cursor positions
+      // either.
+      let header;
       try {
-        // One bounded prefix read per candidate yields both the validated
-        // header and the small identity (name/summary) fields.
-        const { header, identity } = await readSessionPrefix(candidate.file);
-        if (!header) {
+        header = await this.readSavedHeader(candidate.file);
+      } catch (error) {
+        continue;
+      }
+      if (!header) {
+        continue;
+      }
+      let sessionWorkspace;
+      try {
+        sessionWorkspace = normalizeWslPath(header.cwd, "saved Pi session workspace");
+      } catch (error) {
+        // A first line whose cwd is not a normalizable absolute workspace
+        // is not a valid Pi session header; it is skipped like a corrupt
+        // file rather than listed.
+        continue;
+      }
+      if (workspace !== null && sessionWorkspace !== workspace) {
+        continue;
+      }
+      inspected.push({
+        file: candidate.file,
+        modified_at: candidate.modified_at,
+        bytes: candidate.bytes,
+        header,
+        workspace: sessionWorkspace
+      });
+      if (inspected.length > offset + pageSize) {
+        // Early exit once the page is full and one extra valid header proves
+        // that more sessions remain: the cursor still counts VALID session
+        // headers only, so corrupt files never consume page slots or cursor
+        // positions.
+        break;
+      }
+    }
+    // Phase 2: read the bounded identity prefix only for entries actually
+    // returned on this page. The header is re-validated from the same prefix:
+    // a file rewritten between the first-line and prefix reads no longer
+    // matches and is skipped conservatively (it will be re-listed under its new
+    // header on a later scan), so the static case never drops or duplicates an
+    // entry. Positions still count valid first-line headers.
+    const page = [];
+    for (let index = offset; index < inspected.length && index < offset + pageSize; index += 1) {
+      const item = inspected[index];
+      try {
+        const { header, identity } = await this.readSavedIdentity(item.file);
+        if (!header || header.id !== item.header.id || header.cwd !== item.header.cwd) {
           continue;
         }
-        let sessionWorkspace;
-        try {
-          sessionWorkspace = await this.resolveSavedSessionWorkspace(header.cwd);
-        } catch (error) {
-          continue;
-        }
-        if (workspace && sessionWorkspace !== workspace) {
-          continue;
-        }
-        inspected.push({
-          pi_session_id: header.id,
-          workspace: sessionWorkspace,
-          created_at: typeof header.timestamp === "string" ? header.timestamp : candidate.modified_at,
-          modified_at: candidate.modified_at,
-          bytes: candidate.bytes,
-          session_file: candidate.file,
+        page.push({
+          pi_session_id: item.header.id,
+          workspace: item.workspace,
+          created_at: typeof item.header.timestamp === "string" ? item.header.timestamp : item.modified_at,
+          modified_at: item.modified_at,
+          bytes: item.bytes,
           name: identity.name,
           summary: identity.summary
         });
       } catch (error) {
-        // A corrupt or concurrently-written session must not prevent listing the rest.
-      }
-      if (inspected.length >= limit) {
-        break;
+        // A file that became unreadable between the two reads is skipped; it
+        // will be re-listed (or disappear) on a later scan.
       }
     }
-    return inspected.map(({ session_file, ...safe }) => safe);
+    return {
+      entries: page,
+      next_offset: inspected.length > offset + pageSize ? offset + pageSize : null
+    };
+  }
+
+  // First-line session header read for saved-session discovery: one small
+  // bounded read (util.readFirstLine) validates shape only; identity comes
+  // later, only for page entries. A method seam so tests can count which files
+  // received which read.
+  async readSavedHeader(file) {
+    let header;
+    try {
+      header = JSON.parse(await readFirstLine(file));
+    } catch (error) {
+      return null;
+    }
+    return header?.type === "session" && typeof header.id === "string" && typeof header.cwd === "string" ? header : null;
+  }
+
+  // Identity (name/summary) read from the bounded SESSION_PREVIEW_BYTES prefix,
+  // used only for entries actually returned on the current page. The header is
+  // re-parsed from the same prefix so a concurrent rewrite is detected by
+  // scanSavedSessions. A method seam so tests can count reads.
+  async readSavedIdentity(file) {
+    return readSessionPrefix(file);
+  }
+
+  // Resolve Pi's recorded workspace for an explicit resume. Kept as a method
+  // seam so Windows unit tests can model the WSL filesystem while production
+  // still performs the real existence/directory check inside WSL.
+  async resolveRecordedWorkspace(cwd) {
+    return canonicalExistingDirectory(cwd, "recorded workspace of saved Pi session");
+  }
+
+  async resolveSavedSessionFile(file) {
+    return canonicalFileWithin(file, this.sessionRoot, "saved Pi session");
   }
 
   async findSavedSession(piSessionId) {
-    const fileCandidates = await this.walkSessionFiles(5000);
+    let found = null;
+    const fileCandidates = await this.walkSessionFiles();
     for (const candidate of fileCandidates) {
       try {
-        const headerLine = await readFirstLine(candidate.file);
-        const header = JSON.parse(headerLine);
-        if (header?.type !== "session" || header.id !== piSessionId || typeof header.cwd !== "string") {
+        const header = await this.readSavedHeader(candidate.file);
+        if (!header || header.id !== piSessionId) {
           continue;
         }
-        const workspace = await this.resolveSavedSessionWorkspace(header.cwd);
-        const sessionFile = await canonicalFileWithin(candidate.file, this.sessionRoot, "saved Pi session");
-        return {
-          pi_session_id: header.id,
-          workspace,
-          created_at: typeof header.timestamp === "string" ? header.timestamp : candidate.modified_at,
-          session_file: sessionFile
-        };
+        try {
+          normalizeWslPath(header.cwd, "saved Pi session workspace");
+        } catch (error) {
+          // Keep find/resume aligned with pi_sessions: a non-absolute or
+          // otherwise invalid recorded cwd is not a listable saved session.
+          continue;
+        }
+        found = { candidate, header };
+        break;
       } catch (error) {
         // Continue searching when a single historical file is unusable.
       }
     }
-    throw new PiWslError("saved_session_not_found", "No allowed saved Pi session exists with id " + piSessionId + ".");
+    if (!found) {
+      throw new PiWslError("saved_session_not_found", "No saved Pi session exists with id " + piSessionId + ".");
+    }
+    // The recorded workspace must exist and be a directory: discovery still
+    // lists a session whose workspace is gone, but resuming it is impossible
+    // until the directory is restored. No allowed-root check runs here:
+    // resume-by-local-session-id reopens Pi's recorded workspace, even when it
+    // is outside the configured roots for new caller-selected workspaces.
+    let workspace;
+    try {
+      workspace = await this.resolveRecordedWorkspace(found.header.cwd);
+    } catch (error) {
+      if (error instanceof PiWslError && error.code === "workspace_not_found") {
+        throw new PiWslError(
+          "workspace_not_found",
+          "Saved Pi session " + piSessionId + " cannot be resumed because its recorded workspace does not exist: " + normalizeWslPath(found.header.cwd, "saved Pi session workspace") + ". It is still listed by pi_sessions, but the directory must be restored before the session can be resumed."
+        );
+      }
+      throw error;
+    }
+    const sessionFile = await this.resolveSavedSessionFile(found.candidate.file);
+    return {
+      pi_session_id: found.header.id,
+      workspace,
+      created_at: typeof found.header.timestamp === "string" ? found.header.timestamp : found.candidate.modified_at,
+      session_file: sessionFile
+    };
   }
 
-  async walkSessionFiles(maximum) {
+  // Walk the ENTIRE configured session store. Saved-session discovery is
+  // complete: every valid JSONL session header in the store is reachable
+  // through pi_sessions pagination and pi_resume_session, with no cap derived
+  // from page size or the number of sessions.
+  async walkSessionFiles() {
     const candidates = [];
     const pending = [this.sessionRoot];
-    while (pending.length > 0 && candidates.length < maximum) {
+    while (pending.length > 0) {
       const directory = pending.pop();
       let entries;
       try {
         entries = await fs.readdir(directory, { withFileTypes: true });
       } catch (error) {
+        if (directory === this.sessionRoot) {
+          throw new PiWslError(
+            "session_store_unavailable",
+            "Pi session store cannot be read: " + this.sessionRoot + "."
+          );
+        }
         continue;
       }
       for (const entry of entries) {
-        if (candidates.length >= maximum) {
-          break;
-        }
         const target = path.join(directory, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) {
           pending.push(target);
@@ -1596,7 +1805,12 @@ export class PiService {
         }
       }
     }
-    candidates.sort((left, right) => right.modified_ms - left.modified_ms);
+    // Newest first, with a deterministic path tiebreak so pages are stable
+    // across calls even when several files share a modification time.
+    candidates.sort((left, right) =>
+      right.modified_ms - left.modified_ms ||
+      (left.file < right.file ? -1 : left.file > right.file ? 1 : 0)
+    );
     return candidates;
   }
 

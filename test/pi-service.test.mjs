@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PROFILES, PiService, actionableRunError, jobSnapshot, liveDirectoryEntry, savedDirectoryEntry, runProgress, runStats, usageFromMessage } from "../src/pi-service.mjs";
+import { normalizeWslPath } from "../src/util.mjs";
 
 function activeJob(overrides = {}) {
   return {
@@ -559,15 +560,21 @@ test("session listing is a minimal directory unless details are requested", asyn
   const service = {
     sessions: new Map([["session-1", session]]),
     config: { maxSavedSessions: 100 },
-    scanSavedSessions: async () => [{
-      pi_session_id: "pi-9",
-      workspace: "/home/user/work",
-      created_at: "2026-07-01T00:00:00.000Z",
-      modified_at: "2026-07-02T00:00:00.000Z",
-      bytes: 1234,
-      name: "Review pass",
-      summary: "Check the unstaged diff"
-    }],
+    scanSavedSessions: async (_workspace, _pageSize, offset) => {
+      calls.push({ offset });
+      return {
+        entries: [{
+          pi_session_id: "pi-9",
+          workspace: "/home/user/work",
+          created_at: "2026-07-01T00:00:00.000Z",
+          modified_at: "2026-07-02T00:00:00.000Z",
+          bytes: 1234,
+          name: "Review pass",
+          summary: "Check the unstaged diff"
+        }],
+        next_offset: null
+      };
+    },
     liveSummary: (_session, options) => {
       calls.push(options);
       return options ? { session_id: "session-1", job: { run_id: "run-1" } } : { session_id: "session-1" };
@@ -590,6 +597,7 @@ test("session listing is a minimal directory unless details are requested", asyn
   assert.equal(compact.live_sessions[0].job, undefined);
   assert.equal(compact.live_sessions[0].pi_session_file, undefined);
   assert.equal(compact.live_sessions[0].pending_ui_requests, undefined);
+  assert.equal(compact.next_saved_cursor, null, "the final page reports no continuation cursor");
   assert.deepEqual(compact.saved_sessions[0], {
     pi_session_id: "pi-9",
     workspace: "/home/user/work",
@@ -600,13 +608,25 @@ test("session listing is a minimal directory unless details are requested", asyn
   });
   assert.equal(compact.saved_sessions[0].bytes, undefined);
   assert.equal(compact.saved_sessions[0].session_file, undefined);
-  assert.equal(calls.length, 0, "compact listing must not consult liveSummary");
+  assert.equal(calls.length, 1, "compact listing must not consult liveSummary");
+  assert.equal(calls[0].offset, 0, "a first page starts at cursor position zero");
 
   const detailed = await PiService.prototype.listSessions.call(service, { include_details: true });
   assert.equal(detailed.live_sessions[0].job.run_id, "run-1");
-  assert.deepEqual(calls, [{ includeDetails: true }]);
+  assert.deepEqual(calls[1], { offset: 0 }, "the detailed listing still starts at the first page");
+  assert.deepEqual(calls[2], { includeDetails: true });
   assert.equal(detailed.saved_sessions[0].bytes, 1234);
   assert.equal(detailed.saved_sessions[0].session_file, undefined);
+  assert.equal(detailed.next_saved_cursor, null);
+
+  // A returned cursor is passed through as the scan offset; the mock records
+  // only the offset, so the cursor's encoded scope fields are validated by
+  // decodeSavedCursor before the scan runs.
+  const continued = await PiService.prototype.listSessions.call(service, {
+    saved_cursor: Buffer.from(JSON.stringify({ v: 2, o: 7, w: null, p: 100 })).toString("base64url")
+  });
+  assert.deepEqual(calls[3], { offset: 7 }, "saved_cursor must advance the saved-session scan");
+  assert.equal(continued.next_saved_cursor, null);
 });
 
 function sessionJsonl(lines) {
@@ -718,11 +738,9 @@ test("scanSavedSessions derives bounded redacted identity from real session file
 
     const service = Object.assign(Object.create(PiService.prototype), {
       sessionRoot: tmp,
-      allowedRoots: [tmp],
-      config: { maxSavedSessions: 100 },
-      resolveSavedSessionWorkspace: async (cwd) => cwd
+      config: { maxSavedSessions: 100 }
     });
-    const result = await service.scanSavedSessions(tmp, 100);
+    const { entries: result, next_offset } = await service.scanSavedSessions(null, 100);
     const byId = Object.fromEntries(result.map((entry) => [entry.pi_session_id, entry]));
     assert.equal(result.length, 13, "only the corrupt file must be skipped");
     assert.equal(byId["pi-a"].name, "Fix auth bug");
@@ -752,6 +770,7 @@ test("scanSavedSessions derives bounded redacted identity from real session file
     assert.equal(byId["pi-n"].summary, "x".repeat(160) + "…", "truncation never splits a surrogate pair");
     assert.ok(!/[\uD800-\uDFFF]/.test(byId["pi-n"].summary), "no lone surrogate halves may remain after truncation");
     assert.equal(byId["pi-o"], undefined, "a later header must not make a corrupt file listable but unresumable");
+    assert.equal(next_offset, null, "all matching sessions fit on one page");
     for (const entry of result) {
       assert.equal(entry.session_file, undefined, "the scanner must not expose file paths");
       assert.ok(entry.bytes > 0);
@@ -761,27 +780,503 @@ test("scanSavedSessions derives bounded redacted identity from real session file
   }
 });
 
-test("scanSavedSessions filters by workspace and honors the limit", async () => {
+test("scanSavedSessions filters by recorded workspace and pages through the rest", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-limit-"));
   const other = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-other-"));
   try {
     await fs.writeFile(path.join(tmp, "in.jsonl"), sessionJsonl([sessionHeader("pi-in", tmp), userMessage("task in workspace")]));
-    await fs.writeFile(path.join(other, "out.jsonl"), sessionJsonl([sessionHeader("pi-out", other), userMessage("task outside")]));
+    await fs.mkdir(path.join(tmp, "sub"));
+    // The second session lives under the session root too, recorded in a
+    // different (outside-root) workspace.
+    await fs.writeFile(path.join(tmp, "sub", "out.jsonl"), sessionJsonl([sessionHeader("pi-out", other), userMessage("task outside")]));
+    // Deterministic newest-first order: pi-out is newer than pi-in.
+    const now = Date.now() / 1000;
+    await fs.utimes(path.join(tmp, "in.jsonl"), now - 20, now - 20);
+    await fs.utimes(path.join(tmp, "sub", "out.jsonl"), now - 10, now - 10);
     const service = Object.assign(Object.create(PiService.prototype), {
       sessionRoot: tmp,
-      allowedRoots: [tmp, other],
-      config: { maxSavedSessions: 100 },
-      resolveSavedSessionWorkspace: async (cwd) => cwd
+      config: { maxSavedSessions: 100 }
     });
 
-    const filtered = await service.scanSavedSessions(tmp, 100);
-    assert.deepEqual(filtered.map((entry) => entry.pi_session_id), ["pi-in"]);
+    const filtered = await service.scanSavedSessions(normalizeWslPath(tmp), 100);
+    assert.deepEqual(filtered.entries.map((entry) => entry.pi_session_id), ["pi-in"]);
+    assert.equal(filtered.next_offset, null);
 
-    const all = await service.scanSavedSessions(null, 1);
-    assert.equal(all.length, 1, "the limit must bound the directory listing");
+    const page1 = await service.scanSavedSessions(null, 1);
+    assert.deepEqual(page1.entries.map((entry) => entry.pi_session_id), ["pi-out"], "saved sessions are newest first");
+    assert.equal(page1.next_offset, 1, "more valid sessions remain after the first page");
+
+    const page2 = await service.scanSavedSessions(null, 1, page1.next_offset);
+    assert.deepEqual(page2.entries.map((entry) => entry.pi_session_id), ["pi-in"]);
+    assert.equal(page2.next_offset, null, "the final page reports no continuation");
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
     await fs.rm(other, { recursive: true, force: true });
+  }
+});
+
+test("scanSavedSessions lists sessions recorded outside allowed roots or in missing workspaces", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-outside-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-outside-ws-"));
+  const missing = path.join(tmp, "does-not-exist");
+  try {
+    await fs.writeFile(path.join(tmp, "out.jsonl"), sessionJsonl([sessionHeader("pi-outside", outside), userMessage("task outside roots")]));
+    await fs.writeFile(path.join(tmp, "mis.jsonl"), sessionJsonl([sessionHeader("pi-missing", missing), userMessage("task in a vanished workspace")]));
+    await fs.writeFile(path.join(tmp, "in.jsonl"), sessionJsonl([sessionHeader("pi-inside", tmp), userMessage("task inside")]));
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 }
+    });
+
+    const { entries, next_offset } = await service.scanSavedSessions(null, 100);
+    const byId = Object.fromEntries(entries.map((entry) => [entry.pi_session_id, entry]));
+    assert.equal(entries.length, 3, "outside-root and missing-workspace sessions must still be listed");
+    assert.equal(byId["pi-outside"].workspace, normalizeWslPath(outside), "the recorded workspace is normalized and returned even outside allowed roots");
+    assert.equal(byId["pi-missing"].workspace, normalizeWslPath(missing), "a vanished workspace is still reported from the header");
+    assert.equal(byId["pi-inside"].workspace, normalizeWslPath(tmp));
+    assert.equal(next_offset, null);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("listSessions applies the workspace filter as pure metadata without allowed-root resolution", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-filter-meta-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-filter-out-"));
+  const missing = path.join(tmp, "does-not-exist");
+  try {
+    await fs.writeFile(path.join(tmp, "out.jsonl"), sessionJsonl([sessionHeader("pi-out", outside), userMessage("task outside")]));
+    await fs.writeFile(path.join(tmp, "mis.jsonl"), sessionJsonl([sessionHeader("pi-missing", missing), userMessage("task in a vanished workspace")]));
+    await fs.writeFile(path.join(tmp, "win.jsonl"), sessionJsonl([sessionHeader("pi-win", "/mnt/d/WorkSpace/pi-local-mcp"), userMessage("task in a windows drive workspace")]));
+    const liveOut = {
+      id: "session-live-out", lifecycle: "running", workspace: outside,
+      profile: { id: "workspace" }, createdAt: "2026-08-01T00:00:00.000Z",
+      state: {}, job: null, uiRequests: new Map()
+    };
+    const liveIn = {
+      id: "session-live-in", lifecycle: "running", workspace: tmp,
+      profile: { id: "workspace" }, createdAt: "2026-08-01T00:00:00.000Z",
+      state: {}, job: null, uiRequests: new Map()
+    };
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 },
+      sessions: new Map([["session-live-out", liveOut], ["session-live-in", liveIn]]),
+      // Any allowed-root resolution would throw: the metadata workspace filter
+      // must never consult configured roots or check that the path exists.
+      resolveWorkspace: async () => { throw new Error("allowed-root resolution must not run for a metadata workspace filter"); }
+    });
+
+    const outsideResult = await service.listSessions({ workspace: outside });
+    assert.deepEqual(outsideResult.saved_sessions.map((entry) => entry.pi_session_id), ["pi-out"]);
+    assert.deepEqual(outsideResult.live_sessions.map((entry) => entry.session_id), ["session-live-out"], "live sessions are filtered by the same metadata workspace");
+
+    const missingResult = await service.listSessions({ workspace: missing });
+    assert.deepEqual(missingResult.saved_sessions.map((entry) => entry.pi_session_id), ["pi-missing"], "a nonexistent workspace still filters by recorded metadata");
+    assert.deepEqual(missingResult.live_sessions, []);
+
+    const windowsResult = await service.listSessions({ workspace: "D:\\WorkSpace\\pi-local-mcp" });
+    assert.deepEqual(windowsResult.saved_sessions.map((entry) => entry.pi_session_id), ["pi-win"], "Windows drive paths match the recorded WSL form");
+
+    const noneResult = await service.listSessions({ workspace: "/mnt/z/nowhere/project" });
+    assert.deepEqual(noneResult.saved_sessions, []);
+    assert.deepEqual(noneResult.live_sessions, []);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("saved-session pagination reaches every valid session in stable newest-first order", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-paginate-"));
+  const base = Date.now() / 1000;
+  try {
+    for (let index = 0; index < 25; index += 1) {
+      const name = String(index).padStart(2, "0");
+      await fs.writeFile(path.join(tmp, "s" + name + ".jsonl"), sessionJsonl([sessionHeader("pi-" + name, tmp), userMessage("task " + index)]));
+      await fs.utimes(path.join(tmp, "s" + name + ".jsonl"), base - index * 10, base - index * 10);
+    }
+    // Corrupt files and a valid-looking header on line two: never listed and
+    // never consuming page slots or cursor positions.
+    await fs.writeFile(path.join(tmp, "corrupt-a.jsonl"), "garbage\n");
+    await fs.writeFile(path.join(tmp, "corrupt-b.jsonl"), "not json at all\n");
+    await fs.writeFile(path.join(tmp, "corrupt-c.jsonl"), "corrupt prefix\n" + sessionJsonl([sessionHeader("pi-hidden", tmp), userMessage("must not be listed")]));
+
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 },
+      sessions: new Map()
+    });
+
+    const collect = async () => {
+      const ids = [];
+      let cursor = null;
+      let pages = 0;
+      do {
+        const result = await service.listSessions({ limit: 10, saved_cursor: cursor ?? undefined });
+        assert.ok(result.saved_sessions.length <= 10, "pages must stay below the bounded array limit");
+        ids.push(...result.saved_sessions.map((entry) => entry.pi_session_id));
+        cursor = result.next_saved_cursor;
+        pages += 1;
+        assert.ok(pages <= 10, "pagination must terminate");
+      } while (cursor !== null);
+      return { ids, pages };
+    };
+
+    const expected = Array.from({ length: 25 }, (_, index) => "pi-" + String(index).padStart(2, "0"));
+    const first = await collect();
+    assert.equal(first.pages, 3, "25 sessions page as 10/10/5");
+    assert.deepEqual(first.ids, expected, "every valid session is reached exactly once, newest first");
+    assert.ok(!first.ids.includes("pi-hidden"), "corrupt files are never listed");
+    const second = await collect();
+    assert.deepEqual(second.ids, expected, "repeated pagination is stable");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("an invalid saved_cursor is rejected with an actionable error", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-cursor-"));
+  try {
+    await fs.writeFile(path.join(tmp, "a.jsonl"), sessionJsonl([sessionHeader("pi-a", tmp), userMessage("task")]));
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 },
+      sessions: new Map()
+    });
+    const cursorOf = (payload) => Buffer.from(JSON.stringify(payload)).toString("base64url");
+    // Not a cursor at all, a wrong version, a negative or non-integer offset,
+    // a missing/invalid workspace field, and a page size outside the valid
+    // range are all rejected: validation checks accepted shape/scope, not
+    // authenticity (base64url is only a transport encoding).
+    await assert.rejects(
+      service.listSessions({ saved_cursor: "not-a-cursor" }),
+      (error) => error.code === "invalid_saved_cursor" && /returned by pi_sessions/.test(error.message)
+    );
+    for (const payload of [
+      { v: 99, o: 0, w: null, p: 100 },
+      { v: 2, o: -1, w: null, p: 100 },
+      { v: 2, o: 1.5, w: null, p: 100 },
+      { v: 2, o: Number.MAX_SAFE_INTEGER + 1, w: null, p: 100 },
+      { v: 2, o: 0, w: 42, p: 100 },
+      { v: 2, o: 0, w: "relative/project", p: 100 },
+      { v: 2, o: 0, w: "/" + "x".repeat(4001), p: 100 },
+      { v: 2, o: 0, p: 100 },
+      { v: 2, o: 0, w: null },
+      { v: 2, o: 0, w: null, p: 0 },
+      { v: 2, o: 0, w: null, p: 500 }
+    ]) {
+      await assert.rejects(
+        service.listSessions({ saved_cursor: cursorOf(payload) }),
+        (error) => error.code === "invalid_saved_cursor",
+        "payload must be rejected: " + JSON.stringify(payload)
+      );
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("cursor-only continuation preserves the workspace filter and page size; conflicting arguments are rejected", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-cursor-scope-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-cursor-scope-out-"));
+  const base = Date.now() / 1000;
+  try {
+    // Three sessions recorded in the outside-root workspace (newest first:
+    // out-00, out-01, out-02) and one session in the allowed workspace.
+    for (let index = 0; index < 3; index += 1) {
+      const name = String(index).padStart(2, "0");
+      const file = path.join(tmp, "out-" + name + ".jsonl");
+      await fs.writeFile(file, sessionJsonl([sessionHeader("pi-out-" + name, outside), userMessage("outside task " + index)]));
+      await fs.utimes(file, base - index * 10, base - index * 10);
+    }
+    const insideFile = path.join(tmp, "in.jsonl");
+    await fs.writeFile(insideFile, sessionJsonl([sessionHeader("pi-in", tmp), userMessage("inside task")]));
+    await fs.utimes(insideFile, base - 5, base - 5);
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 },
+      sessions: new Map()
+    });
+
+    const page1 = await service.listSessions({ workspace: outside, limit: 2 });
+    assert.deepEqual(page1.saved_sessions.map((entry) => entry.pi_session_id), ["pi-out-00", "pi-out-01"]);
+    assert.ok(page1.next_saved_cursor, "a page with more sessions carries a continuation cursor");
+
+    // Cursor-only continuation: no workspace and no limit are repeated, yet
+    // the outside-root filter and the original page size are preserved.
+    const page2 = await service.listSessions({ saved_cursor: page1.next_saved_cursor });
+    assert.deepEqual(
+      page2.saved_sessions.map((entry) => entry.pi_session_id),
+      ["pi-out-02"],
+      "cursor-only continuation must keep the workspace-outside-roots filter"
+    );
+    assert.equal(page2.next_saved_cursor, null, "the final page reports no continuation");
+    assert.ok(!page2.saved_sessions.some((entry) => entry.pi_session_id === "pi-in"), "no inside-workspace session may leak in");
+
+    // Supplying workspace/limit that normalize to the cursor's own scope is
+    // allowed and reproduces the same page.
+    const sameScope = await service.listSessions({ saved_cursor: page1.next_saved_cursor, workspace: outside, limit: 2 });
+    assert.deepEqual(sameScope.saved_sessions.map((entry) => entry.pi_session_id), ["pi-out-02"]);
+
+    // Conflicting workspace or limit is rejected with an actionable message.
+    await assert.rejects(
+      service.listSessions({ saved_cursor: page1.next_saved_cursor, workspace: tmp }),
+      (error) => error.code === "invalid_saved_cursor" && /start a new listing/i.test(error.message)
+    );
+    await assert.rejects(
+      service.listSessions({ saved_cursor: page1.next_saved_cursor, limit: 5 }),
+      (error) => error.code === "invalid_saved_cursor" && /start a new listing/i.test(error.message)
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("a maximum-length workspace filter produces a cursor that can round-trip", async () => {
+  const longWorkspace = "/" + "路".repeat(3999);
+  const calls = [];
+  const service = Object.assign(Object.create(PiService.prototype), {
+    config: { maxSavedSessions: 100 },
+    sessions: new Map(),
+    scanSavedSessions: async (workspace, pageSize, offset) => {
+      calls.push({ workspace, pageSize, offset });
+      return { entries: [], next_offset: offset === 0 ? pageSize : null };
+    }
+  });
+
+  const first = await service.listSessions({ workspace: longWorkspace, limit: 2 });
+  assert.ok(first.next_saved_cursor.length > 400, "the regression cursor must exceed the old schema bound");
+  assert.ok(first.next_saved_cursor.length < 24000, "the cursor fits the MCP schema bound");
+  const second = await service.listSessions({ saved_cursor: first.next_saved_cursor });
+  assert.equal(second.next_saved_cursor, null);
+  assert.deepEqual(calls, [
+    { workspace: longWorkspace, pageSize: 2, offset: 0 },
+    { workspace: longWorkspace, pageSize: 2, offset: 2 }
+  ]);
+});
+
+test("saved-session scan reads only first-line headers for off-page candidates and the next-page probe", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-phases-"));
+  const base = Date.now() / 1000;
+  try {
+    // 30 valid sessions, newest first by construction (position k is s{k}).
+    for (let index = 0; index < 30; index += 1) {
+      const name = String(index).padStart(2, "0");
+      const file = path.join(tmp, "s" + name + ".jsonl");
+      await fs.writeFile(file, sessionJsonl([sessionHeader("pi-" + name, tmp), userMessage("task " + index)]));
+      await fs.utimes(file, base - index * 10, base - index * 10);
+    }
+    // Corrupt files sort last (oldest mtimes): they never reach the early
+    // exit, so the read counts below stay deterministic.
+    await fs.writeFile(path.join(tmp, "corrupt-a.jsonl"), "garbage\n");
+    await fs.writeFile(path.join(tmp, "corrupt-b.jsonl"), "not json\n");
+    await fs.utimes(path.join(tmp, "corrupt-a.jsonl"), base - 1000, base - 1000);
+    await fs.utimes(path.join(tmp, "corrupt-b.jsonl"), base - 1000, base - 1000);
+
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 },
+      sessions: new Map()
+    });
+    const headerReads = [];
+    const identityReads = [];
+    service.readSavedHeader = async (file) => {
+      headerReads.push(file);
+      return PiService.prototype.readSavedHeader.call(service, file);
+    };
+    service.readSavedIdentity = async (file) => {
+      identityReads.push(file);
+      return PiService.prototype.readSavedIdentity.call(service, file);
+    };
+
+    const { entries, next_offset } = await service.scanSavedSessions(null, 10, 10);
+    assert.deepEqual(entries.map((entry) => entry.pi_session_id), Array.from({ length: 10 }, (_, i) => "pi-" + String(i + 10).padStart(2, "0")));
+    assert.equal(next_offset, 20, "the next-page probe proves more valid headers remain");
+
+    // Positions 0-9 (before the offset) and position 20 (the extra probe)
+    // get first-line reads only; positions 10-19 (the page) get the 256KiB
+    // identity prefix read. Corrupt files never consume a position or a read.
+    const s = (index) => path.join(tmp, "s" + String(index).padStart(2, "0") + ".jsonl");
+    assert.deepEqual(
+      headerReads,
+      Array.from({ length: 21 }, (_, index) => s(index)),
+      "every candidate through the extra probe is read once, first line only"
+    );
+    assert.deepEqual(
+      identityReads,
+      Array.from({ length: 10 }, (_, index) => s(index + 10)),
+      "the 256KiB identity prefix is read only for entries returned on the page"
+    );
+    assert.ok(!identityReads.some((file) => file.includes("corrupt")), "corrupt files never receive an identity read");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("a file rewritten between the header and identity reads is skipped without shifting page positions", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-scan-rewrite-"));
+  const base = Date.now() / 1000;
+  try {
+    for (let index = 0; index < 25; index += 1) {
+      const name = String(index).padStart(2, "0");
+      const file = path.join(tmp, "s" + name + ".jsonl");
+      await fs.writeFile(file, sessionJsonl([sessionHeader("pi-" + name, tmp), userMessage("task " + index)]));
+      await fs.utimes(file, base - index * 10, base - index * 10);
+    }
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 },
+      sessions: new Map()
+    });
+
+    // Static case: every page entry matches its first-line header, so none
+    // is dropped or duplicated.
+    const staticResult = await service.scanSavedSessions(null, 10, 10);
+    assert.equal(staticResult.entries.length, 10);
+    assert.equal(staticResult.next_offset, 20);
+
+    // Dynamic case: s12.jsonl is rewritten between the two reads (its
+    // identity prefix now carries a different header). It is skipped
+    // conservatively; positions still count valid first-line headers.
+    service.readSavedIdentity = async (file) => {
+      if (path.basename(file) === "s12.jsonl") {
+        return { header: { type: "session", id: "pi-other", cwd: tmp }, identity: { name: "replaced", summary: "rewritten" } };
+      }
+      return PiService.prototype.readSavedIdentity.call(service, file);
+    };
+    const { entries, next_offset } = await service.scanSavedSessions(null, 10, 10);
+    assert.equal(entries.length, 9, "the rewritten file is skipped, never emitted with a mismatched header");
+    assert.ok(!entries.some((entry) => entry.pi_session_id === "pi-12"));
+    assert.equal(next_offset, 20, "page positions are unchanged: they count first-line headers");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable session root is an error, never an empty session directory", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-missing-store-"));
+  await fs.rm(tmp, { recursive: true, force: true });
+  const service = Object.assign(Object.create(PiService.prototype), {
+    sessionRoot: tmp,
+    config: { maxSavedSessions: 100 },
+    sessions: new Map()
+  });
+  await assert.rejects(
+    service.listSessions(),
+    (error) => error.code === "session_store_unavailable" && error.message.includes(tmp)
+  );
+});
+
+test("a saved header with a non-absolute cwd is neither listed nor resumable", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-invalid-cwd-"));
+  try {
+    await fs.writeFile(path.join(tmp, "bad.jsonl"), sessionJsonl([
+      sessionHeader("pi-invalid-cwd", "relative/project"),
+      userMessage("task")
+    ]));
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 },
+      sessions: new Map()
+    });
+    const listed = await service.listSessions();
+    assert.deepEqual(listed.saved_sessions, []);
+    await assert.rejects(
+      service.findSavedSession("pi-invalid-cwd"),
+      (error) => error.code === "saved_session_not_found"
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("resume outside allowed roots launches in the recorded existing workspace without allowed-root resolution", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-resume-out-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-resume-ws-"));
+  try {
+    await fs.writeFile(path.join(tmp, "s.jsonl"), sessionJsonl([sessionHeader("pi-out", outside), userMessage("task")]));
+    let captured = null;
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      allowedRoots: [tmp],
+      config: { maxSavedSessions: 100 },
+      resolveRecordedWorkspace: async () => outside,
+      resolveSavedSessionFile: async (file) => file,
+      startSession: async (input, internal) => {
+        captured = { input, internal };
+        return { session_id: "live-1", lifecycle: "running", workspace: internal.workspace, profile: { id: input.profile } };
+      }
+    });
+    const result = await service.resume({ saved_session_id: "pi-out", profile: "research" });
+    assert.equal(captured.internal.workspace, outside, "resume must launch in the recorded workspace even outside allowed roots");
+    assert.ok(captured.input.sessionPath.endsWith("s.jsonl"), "the canonicalized session file is passed to the launcher");
+    assert.equal(captured.input.profile, "research");
+    assert.equal(captured.input.workspace, undefined, "resume must not pass a caller-controlled workspace");
+    assert.equal(result.resumed_from.saved_session_id, "pi-out");
+    assert.equal(result.resumed_from.workspace, outside);
+    assert.equal(result.session.session_id, "live-1");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("a session recorded in a missing workspace stays listed but resume fails with an actionable workspace error", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-resume-missing-"));
+  const missing = path.join(tmp, "gone");
+  try {
+    await fs.writeFile(path.join(tmp, "m.jsonl"), sessionJsonl([sessionHeader("pi-missing", missing), userMessage("task")]));
+    let started = false;
+    const service = Object.assign(Object.create(PiService.prototype), {
+      sessionRoot: tmp,
+      config: { maxSavedSessions: 100 },
+      startSession: async () => {
+        started = true;
+        throw new Error("resume must not launch without an existing workspace");
+      }
+    });
+
+    const { entries } = await service.scanSavedSessions(null, 100);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].pi_session_id, "pi-missing");
+    const normalizedMissing = normalizeWslPath(missing);
+    assert.equal(entries[0].workspace, normalizedMissing, "discovery still lists the normalized recorded workspace");
+
+    await assert.rejects(
+      service.resume({ saved_session_id: "pi-missing" }),
+      (error) => error.code === "workspace_not_found" &&
+        error.message.includes("pi-missing") &&
+        error.message.includes(normalizedMissing) &&
+        /still listed by pi_sessions/.test(error.message)
+    );
+    assert.equal(started, false, "resume must fail before launching Pi");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("new workspace selection remains constrained by allowed roots", {
+  skip: process.platform !== "linux" && "Workspace filesystem resolution runs inside the WSL/Linux bridge runtime."
+}, async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-roots-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "piwsl-roots-out-"));
+  try {
+    const service = Object.create(PiService.prototype);
+    service.allowedRoots = [tmp];
+    await assert.rejects(
+      service.resolveWorkspace(outside),
+      (error) => error.code === "workspace_not_allowed"
+    );
+    await assert.rejects(
+      service.resolveWorkspace(path.join(tmp, "does-not-exist")),
+      (error) => error.code === "workspace_not_found"
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
   }
 });
 
