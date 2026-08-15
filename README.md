@@ -206,34 +206,6 @@ the job snapshot with recent events) and adds saved-session byte sizes.
 `pi_status` remains the dedicated diagnostic view and keeps the detailed
 snapshot without duplicating tool calls inside the event stream.
 
-`pi_sessions` covers **all local saved Pi sessions**: it scans the entire
-configured session store (newest first by file modification time), including
-sessions recorded in workspaces outside the configured allowed roots and
-sessions whose recorded workspace no longer exists. The list is paginated so
-every saved session is reachable: each page stays compact (capped at 100
-entries, below the server's bounded array limit, so structured output is
-never silently truncated), and the returned `next_saved_cursor` is passed
-back as `saved_cursor` to fetch the next page; the last page reports
-`next_saved_cursor: null`. The cursor is self-contained: it carries the
-normalized workspace filter and the effective page size, so a continuation
-call passes only `saved_cursor` — `workspace` and `limit` do not need to be
-repeated, and supplying a `workspace` or `limit` that does not match the
-cursor's scope is rejected with `invalid_saved_cursor` and a message telling
-the caller to start a new listing instead. Cursor positions count valid
-session headers only - corrupt or concurrently written files are skipped and
-never consume page slots. Scanning reads just the first-line header of every
-candidate, and the bounded identity prefix (name/summary) is read only for
-entries actually returned on a page, so large stores stay fast. The
-`workspace` argument is a metadata filter, not a root check: it
-accepts any absolute WSL or Windows drive path (for example
-`D:\projects\example` matching a recorded `/mnt/d/projects/example`) and
-narrows both live and saved sessions by their recorded workspace string.
-Resuming is separate from workspace selection: to reopen a listed saved
-session, pass its `pi_session_id` to `pi_resume_session`, which restarts Pi
-in that session's recorded workspace; to start **new** work in another
-workspace, pass `workspace` to `pi_task`/`pi_start_session` (new-workspace
-selection stays constrained by `PI_WSL_MCP_ALLOWED_ROOTS`).
-
 ### Timeouts, continuation, and optional budgets
 
 pi_task/pi_review/pi_research accept `wait_seconds` and pi_wait accepts
@@ -470,7 +442,7 @@ arbitrary user can run the bridge with zero setup.
 | PI_WSL_MCP_MAX_WAIT_SECONDS | 285 | Cap for pi_wait/pi_task wait blocking, kept below Codex's 300s tool timeout |
 | PI_WSL_MCP_STARTUP_TIMEOUT_MS | 45000 | Pi startup acknowledgement timeout |
 | PI_WSL_MCP_COMMAND_TIMEOUT_MS | 30000 | Individual Pi RPC acknowledgement timeout |
-| PI_WSL_MCP_MAX_SAVED_SESSIONS | 100 | Default page size for `pi_sessions` saved sessions; any page is capped at 100 entries - continue with `saved_cursor`/`next_saved_cursor` to reach the rest |
+| PI_WSL_MCP_MAX_SAVED_SESSIONS | 100 | Saved sessions returned by pi_sessions at most |
 | PI_WSL_MCP_RESULT_LIMIT | 24000 | Bounds the final Pi answer in `content[0].text` and every nested diagnostic string; truncation is explicit |
 | PI_WSL_MCP_HISTORY_LIMIT | 80 | Bounded history entry count |
 | PI_WSL_MCP_TOOLSET | `core` | MCP tool surface: `core` registers the 9 daily-agent workflow tools; `full` registers the complete 20-tool surface. Invalid values are rejected at startup |
@@ -512,13 +484,8 @@ When a host launches the bridge from a project directory, that directory
 becomes the default workspace and the default allowed root; add further
 project directories explicitly when a second workspace is needed. Sessions
 are pinned to the workspace chosen at creation and cannot be silently moved
-elsewhere. `pi_resume_session` reopens a local saved session in Pi's recorded
-workspace even when that workspace lies outside the configured roots; those
-roots govern caller-selected workspaces for new sessions, not restoration by
-an explicit local session id. The recorded directory must still exist: a
-session whose workspace was deleted stays listed by `pi_sessions`, and
-resuming it fails with a clear `workspace_not_found` error until the directory
-is restored.
+elsewhere; restoring a saved session re-checks its recorded workspace
+against the configured roots.
 
 ## Migrating from Pi Local MCP
 

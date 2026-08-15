@@ -197,12 +197,6 @@ try {
   assert.ok(reviewSchema.includes('"session_id"'));
   assert.ok(reviewSchema.includes('"auto_close"'));
   assert.ok(reviewSchema.includes('"max_model_calls"'), "pi_review must accept optional budgets.");
-  const sessionsTool = listed.result?.tools?.find((tool) => tool.name === "pi_sessions");
-  const sessionsSchema = JSON.stringify(sessionsTool?.inputSchema || {});
-  assert.ok(sessionsSchema.includes('"saved_cursor"'), "pi_sessions must accept a saved_cursor for continuation.");
-  const sessionsDescription = sessionsTool?.description || "";
-  assert.match(sessionsDescription, /all local saved Pi sessions/i, "pi_sessions must advertise the full local store.");
-  assert.match(sessionsDescription, /next_saved_cursor/, "pi_sessions must explain cursor continuation.");
 
   const info = await request("tools/call", {
     name: "pi_info",
@@ -221,49 +215,6 @@ try {
     true,
     "directory-style results succeed even though they carry no answer"
   );
-
-  // Saved-session pagination contract, exercised on the real local store in
-  // both protocol eras: pages stay bounded, and the returned cursor continues
-  // to the next newest session. The cursor is self-contained: the second page
-  // passes ONLY saved_cursor (no limit, no workspace) and must reproduce the
-  // original page size and scope.
-  const pageOne = await request("tools/call", {
-    name: "pi_sessions",
-    arguments: { limit: 1 }
-  });
-  assert.equal(pageOne.error, undefined);
-  const pageOneResult = pageOne.result?.structuredContent?.result;
-  assert.ok("next_saved_cursor" in pageOneResult, "pi_sessions must report cursor continuation fields.");
-  assert.equal(pageOneResult?.saved_sessions?.length, 1, "a bounded page must never be silently truncated.");
-  if (pageOneResult?.next_saved_cursor !== null) {
-    const pageTwo = await request("tools/call", {
-      name: "pi_sessions",
-      arguments: { saved_cursor: pageOneResult.next_saved_cursor }
-    });
-    assert.equal(pageTwo.error, undefined);
-    const pageTwoResult = pageTwo.result?.structuredContent?.result;
-    assert.equal(pageTwoResult?.saved_sessions?.length, 1, "cursor-only continuation must keep the original page size.");
-    assert.notEqual(
-      pageTwoResult?.saved_sessions?.[0]?.pi_session_id,
-      pageOneResult?.saved_sessions?.[0]?.pi_session_id,
-      "cursor continuation must move to the next newest saved session."
-    );
-    // A conflicting workspace or limit alongside the cursor must be rejected
-    // with an actionable "start a new listing" error, never silently ignored.
-    for (const conflicting of [{ limit: 5 }, { workspace: "/mnt" }]) {
-      const conflict = await request("tools/call", {
-        name: "pi_sessions",
-        arguments: { saved_cursor: pageOneResult.next_saved_cursor, ...conflicting }
-      });
-      assert.equal(conflict.error, undefined);
-      assert.equal(conflict.result?.isError, true, "conflicting cursor arguments must fail the call.");
-      assert.match(
-        conflict.result?.content?.[0]?.text || "",
-        /invalid_saved_cursor.*start a new listing/i,
-        "the conflict error must tell the caller to start a new listing."
-      );
-    }
-  }
 
   if (process.argv.includes("--live")) {
     const research = await request("tools/call", {
@@ -339,10 +290,6 @@ try {
         listedSessions.result?.structuredContent?.success,
         true,
         "pi_sessions succeeds with has_answer=false"
-      );
-      assert.ok(
-        "next_saved_cursor" in listedSessions.result?.structuredContent?.result,
-        "pi_sessions must report cursor continuation fields."
       );
       for (const entry of listedSessions.result?.structuredContent?.result?.live_sessions || []) {
         assert.equal(entry.job, undefined, "pi_sessions must be compact by default (no job snapshot).");

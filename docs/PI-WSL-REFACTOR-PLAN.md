@@ -2,15 +2,6 @@
 
 日期：2026-08-09
 
-> **更正（2026-08）**：`pi_sessions` 现在列出本地 Pi 会话存储中的**全部**已保存会话
-> （含记录工作区在 allowed roots 之外、或工作区已不存在的会话），按文件修改时间倒序
-> 分页（`saved_cursor`/`next_saved_cursor` 续页，每页上限 100）；`workspace` 参数只是
-> 元数据过滤（接受任意绝对 WSL/Windows 盘符路径），不做 allowed-root 或存在性检查。
-> `pi_resume_session` 按本地 `pi_session_id` 恢复时会沿用记录的工作区，即使它在
-> allowed roots 之外，但该目录必须存在；目录缺失时会话仍被列出，恢复时返回明确的
-> `workspace_not_found` 错误。allowed roots 约束仅适用于**新建**会话时的工作区选择
-> （`pi_task`/`pi_start_session`/`pi_review`/`pi_research`）。
-
 ## 已确认的目标与边界
 
 `Pi WSL MCP` 是任意 MCP host 与用户**既有 WSL Pi**之间的本地 stdio
