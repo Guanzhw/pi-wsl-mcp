@@ -70,7 +70,8 @@ test("job snapshots are compact by default and detailed only on request", () => 
   assert.equal(compact.stats.model_calls, 0);
 
   const detailed = jobSnapshot(job, { includeDetails: true });
-  assert.equal(detailed.result.assistant_text, "Compact answer.");
+  assert.equal(detailed.result, null, "the final answer stays out of structured run diagnostics");
+  assert.equal(detailed.result?.assistant_text, undefined);
   assert.equal(detailed.recent_events.length, 1);
   assert.equal(detailed.streamed_message_updates, 42);
   assert.equal(detailed.tool_calls, undefined);
@@ -107,7 +108,8 @@ test("wait lifts the answer while keeping its run snapshot compact by default", 
     include_details: true
   });
   assert.equal(detailed.answer, "Compact answer.");
-  assert.equal(detailed.run.result.assistant_text, "Compact answer.");
+  assert.equal(detailed.run.result, null, "the final answer stays in the answer carrier only");
+  assert.equal(detailed.run.result?.assistant_text, undefined);
   assert.equal(detailed.run.recent_events.length, 1);
 });
 
@@ -167,6 +169,48 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
     timeout_seconds: 100
   });
   assert.equal(free.wait, undefined, "waits under the cap are never flagged as clamped");
+});
+
+test("status defaults to a compact live/job snapshot and opts into bounded diagnostics", async () => {
+  const session = {
+    id: "session-1",
+    lifecycle: "running",
+    workspace: "/home/user/work",
+    profile: { id: "review" },
+    createdAt: "2026-08-01T00:00:00.000Z",
+    state: null,
+    uiRequests: new Map(),
+    job: settledJob(),
+    rpc: {
+      protocolWarnings: [],
+      command: async () => ({ data: { model: { provider: "deepseek", id: "deepseek-v4-flash" }, thinkingLevel: "low" } })
+    }
+  };
+  const service = {
+    config: { resultLimit: 1000 },
+    getSession: () => session,
+    liveSummary: PiService.prototype.liveSummary,
+    syncState: PiService.prototype.syncState
+  };
+
+  const compact = await PiService.prototype.status.call(service, { session_id: "session-1" });
+  assert.equal(compact.job.run_id, "run-1");
+  assert.equal(compact.job.result, undefined);
+  assert.equal(compact.job.recent_events, undefined);
+  assert.equal(compact.job.tool_calls, undefined);
+  assert.deepEqual(compact.continuation, {
+    pi_wait: { session_id: "session-1", run_id: "run-1" },
+    pi_status: { session_id: "session-1" }
+  });
+
+  const detailed = await PiService.prototype.status.call(service, {
+    session_id: "session-1",
+    include_details: true
+  });
+  assert.equal(detailed.job.result, null);
+  assert.equal(detailed.job.result?.assistant_text, undefined);
+  assert.equal(detailed.job.recent_events.length, 1);
+  assert.deepEqual(detailed.continuation, compact.continuation);
 });
 
 test("an expiring wait for a still-active run returns a structured timeout, never throws", async () => {
@@ -448,7 +492,8 @@ test("task honors requested details without waiting", async () => {
     wait_seconds: 0,
     include_details: true
   });
-  assert.equal(detailed.run.result.assistant_text, "Compact answer.");
+  assert.equal(detailed.run.result, null, "the final answer stays in the answer carrier only");
+  assert.equal(detailed.run.result?.assistant_text, undefined);
   assert.equal(detailed.run.recent_events.length, 1);
 });
 

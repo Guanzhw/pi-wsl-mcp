@@ -245,8 +245,8 @@ try {
     assert.equal(research.result?.structuredContent?.answer, undefined, "structuredContent must not duplicate the full answer.");
     assert.equal(
       liveResult?.run?.result?.assistant_text,
-      researchAnswer,
-      "include_details must preserve the detailed run snapshot with the assistant text."
+      undefined,
+      "include_details diagnostics must never duplicate the answer in run.result."
     );
     // DeepSeek's native search runs server-side: the deepseek-responses
     // web-search extension injects {type:"web_search"} into the provider
@@ -397,7 +397,7 @@ try {
         assert.equal(workspaceResult?.run?.status, "settled");
         const workspaceAnswer = answerFromContent(workspaceTask.result?.content?.[0]?.text, "Pi completed a new task.");
         assert.ok(workspaceAnswer && workspaceAnswer.length > 0, "settled workspace task must carry the answer in content[0].text.");
-        assert.equal(workspaceAnswer, workspaceResult?.run?.result?.assistant_text);
+        assert.equal(workspaceResult?.run?.result?.assistant_text, undefined);
         assert.equal(workspaceTask.result?.structuredContent?.answer, undefined);
         assert.equal(workspaceResult?.run?.progress?.phase, "settled");
         assert.ok(workspaceResult?.run?.stats?.model_calls >= 1, "compact stats must count real assistant message_end events.");

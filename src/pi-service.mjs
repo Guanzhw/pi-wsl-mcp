@@ -326,9 +326,18 @@ export function runStats(job) {
 // Compact-by-default run snapshot. The compact form keeps everything needed to
 // continue (ids, status, timing, errors, bounded progress, compact usage
 // statistics, pending UI requests) without the diagnostic payload;
-// includeDetails restores the full snapshot. tool_calls is intentionally
-// omitted from the detailed form because it is fully redundant with the
-// bounded recent_events stream (tool_execution_start/end summaries).
+// includeDetails restores bounded diagnostics. tool_calls is intentionally
+// omitted because it is fully redundant with the bounded recent_events stream
+// (tool_execution_start/end summaries). The final assistant text is an answer
+// channel owned by the MCP server, never a structured run diagnostic.
+function diagnosticRunResult(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return null;
+  }
+  const { assistant_text: _assistantText, ...diagnostics } = result;
+  return Object.keys(diagnostics).length > 0 ? diagnostics : null;
+}
+
 export function jobSnapshot(job, options = {}) {
   if (!job) {
     return null;
@@ -361,7 +370,7 @@ export function jobSnapshot(job, options = {}) {
     output.budget_exceeded = job.budget.exceeded || null;
   }
   if (includeDetails) {
-    output.result = job.result || null;
+    output.result = diagnosticRunResult(job.result);
     output.streamed_message_updates = job.messageUpdates;
     output.recent_events = job.events.slice(-30);
   }
@@ -1331,7 +1340,11 @@ export class PiService {
         session.lifecycle = "faulted";
       }
     }
-    return this.liveSummary(session, true);
+    const result = this.liveSummary(session, { includeDetails: Boolean(input.include_details) });
+    // Keep status directly useful as a continuation point even when the
+    // compact default omits diagnostic event/result payloads.
+    result.continuation = continuationFor(session.id, session.job?.id);
+    return result;
   }
 
   async cancel(input) {

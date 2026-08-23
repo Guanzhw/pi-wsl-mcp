@@ -108,6 +108,13 @@ start-session, or extension-command controls:
 
     PI_WSL_MCP_TOOLSET=full
 
+The core/full choice is owned by this MCP server; Codex (or another MCP host)
+may defer exposing a registered tool in its own catalog. If a named core tool
+is not initially visible, search the host's deferred tool catalog before
+changing the bridge. Use `PI_WSL_MCP_TOOLSET=full` and restart the host only
+when an advanced tool genuinely absent from core is needed. The bridge does not
+add a gateway or a duplicate tool to work around host-side deferred exposure.
+
 ## Profiles
 
 | Profile | Intended use | Pi tool policy |
@@ -185,8 +192,10 @@ known; no ETA is ever invented) and compact `stats` (elapsed_ms, model_calls
 counted from real assistant `message_end` events exactly once,
 input/output/cache read/cache write/reasoning/total token usage counters under
 `usage`, cost, and a bounded provider/model breakdown). Pass
-`include_details: true` to those tools to restore the full diagnostic run
-snapshot (assistant text, recent tool events, streamed message counts). Calls
+`include_details: true` to those tools to restore the full bounded diagnostic
+run snapshot (recent tool events, streamed message counts, and other
+diagnostics; the assistant text is never copied into a structured snapshot).
+Calls
 without an answer - for example a timed-out wait - end with a concise summary
 plus session/run references instead of a payload dump.
 `pi_sessions` returns a minimal session directory by default: live entries
@@ -202,9 +211,12 @@ fixed-size session-file prefix. Assistant/tool output and saved-session file
 paths are never exposed, and saved byte sizes stay out of the default output.
 `include_details: true` restores the full diagnostic live summary (model,
 thinking level, streaming state, protocol warnings, pending UI requests, and
-the job snapshot with recent events) and adds saved-session byte sizes.
-`pi_status` remains the dedicated diagnostic view and keeps the detailed
-snapshot without duplicating tool calls inside the event stream.
+the job snapshot with recent events, but never `run.result.assistant_text`) and
+adds saved-session byte sizes.
+`pi_status` is the dedicated live process/run view. It returns a compact live
+and job snapshot by default (without `result`, `recent_events`, or
+`tool_calls`); pass `include_details: true` for bounded diagnostics. The
+final assistant answer has one carrier only: `content[0].text`.
 
 ### Timeouts, continuation, and optional budgets
 

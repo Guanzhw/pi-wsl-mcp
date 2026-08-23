@@ -86,11 +86,17 @@ Responses 原生 `web_search` 的进程；Pi RPC 还会明确排除该同名工�
 
 - `content[0].text` 是默认唯一的最终 Pi 文本载体，带有 `untrusted` 标记和很短的
   状态/会话引用。
+- `pi_status` 默认返回紧凑的 live/job 快照，不包含 `result`、`recent_events` 或
+  `tool_calls`；`include_details=true` 才请求有界的模型、协议、UI、结果和事件诊断，
+  但结构化快照永远不含 `run.result.assistant_text`。
 - `structuredContent` 只保留机器可用的状态、会话/运行 id、进度、用量、错误和
   `answer_meta`（是否有回答、是否截断、原始字符数）；默认不再复制全文回答。
 - `PI_WSL_MCP_RESULT_LIMIT` 实际控制默认最终回答及嵌套诊断字符串的上限，截断必须
   明确报告。`include_details=true` 才可请求有界的事件/诊断流，且文档说明它会增加
   token 成本。
+- MCP server 负责 `core`/`full` 工具选择；Codex 等 host 负责自己的 deferred tool
+  暴露。若 core 工具暂时不可见，先搜索 host 的 deferred catalog；只有确实需要
+  core 没有的高级工具时，才设置 `PI_WSL_MCP_TOOLSET=full` 并重启 host。
 - 收到 `agent_settled` 并不自动代表模型成功。若 Pi 事件显示 `stop_reason=error`、
   没有可收集的回答，或最终收集失败，run 必须为 `error`，携带经脱敏的可行动错误；
   绝不能报告空回答的 `settled`。

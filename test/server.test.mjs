@@ -446,7 +446,8 @@ test("include_details restores the full diagnostic run snapshot and is threaded 
       truncated: false,
       original_chars: "The package name is pi-wsl-mcp.".length
     });
-    assert.equal(result.structuredContent?.result?.run?.result?.assistant_text, "The package name is pi-wsl-mcp.");
+    assert.equal(result.structuredContent?.result?.run?.result?.assistant_text, undefined, "structured diagnostics never carry assistant_text");
+    assert.ok(!JSON.stringify(result.structuredContent?.result || {}).includes("assistant_text"));
     assert.equal(result.structuredContent?.result?.run?.recent_events?.length, 2);
     assert.equal(result.structuredContent?.result?.run?.streamed_message_updates, 3);
     // The answer channel still is not duplicated at the top level of the result.
@@ -714,6 +715,44 @@ test("plain rejected errors stay isError-only and never carry a structured succe
   });
 });
 
+test("pi_status exposes include_details and keeps the answer out of structured snapshots", async () => {
+  const calls = [];
+  const service = {
+    status: async (input) => {
+      calls.push(input);
+      return {
+        session_id: "session-1",
+        lifecycle: "running",
+        job: input.include_details
+          ? {
+              run_id: "run-1",
+              status: "settled",
+              result: { assistant_text: "must stay in content" },
+              recent_events: [{ type: "agent_settled" }]
+            }
+          : { run_id: "run-1", status: "running" },
+        continuation: { pi_status: { session_id: "session-1" } }
+      };
+    }
+  };
+
+  await withClient(service, async (client) => {
+    const statusTool = (await client.listTools()).tools.find((tool) => tool.name === "pi_status");
+    assert.equal(statusTool.inputSchema.properties.include_details.type, "boolean");
+    assert.deepEqual(statusTool.inputSchema.required, ["session_id"]);
+
+    const compact = await client.callTool({ name: "pi_status", arguments: { session_id: "session-1" } });
+    assert.equal(compact.structuredContent?.result?.job?.recent_events, undefined);
+
+    const detailed = await client.callTool({ name: "pi_status", arguments: { session_id: "session-1", include_details: true } });
+    assert.equal(calls[0].include_details, undefined);
+    assert.equal(calls[1].include_details, true);
+    assert.equal(detailed.structuredContent?.result?.job?.recent_events?.length, 1);
+    assert.equal(detailed.structuredContent?.result?.job?.result?.assistant_text, undefined);
+    assert.deepEqual(detailed.structuredContent?.result?.continuation, { pi_status: { session_id: "session-1" } });
+  });
+});
+
 test("pi_wait accepts include_details and reflects it in the run snapshot", async () => {
   const calls = [];
   const service = {
@@ -775,7 +814,7 @@ test("the default core toolset registers exactly the daily-agent workflow tools"
       coreOrder.every((name, i) => i === 0 || instructions.indexOf(name) > instructions.indexOf(coreOrder[i - 1])),
       "core instructions must lead with the fastest user journeys in order"
     );
-    assert.match(instructions, /Use full for cancel, history, models, UI responses, compact, fork, and commands/, "core instructions must keep the full-only boundary useful");
+    assert.match(instructions, /Server owns core\/full selection; if a core tool is hidden, search the host deferred catalog; use full plus restart only for advanced tools absent from core/, "core instructions must explain server and host tool ownership");
     assert.ok(!instructions.includes("pi_history"), "core instructions must not advertise full-only tools");
   }, { injectToolset: false });
 });
@@ -798,7 +837,7 @@ test("the full toolset registers all 20 tools with their current names and core 
       assert.ok(names.includes(name), "full must register " + name);
     }
     const fullInstructions = client.getInstructions() || "";
-    assert.ok(fullInstructions.length < 340, "full instructions must stay compact (" + fullInstructions.length + " chars)");
+    assert.ok(fullInstructions.length < 460, "full instructions must stay compact (" + fullInstructions.length + " chars)");
     assert.match(fullInstructions, /pi_task: one-call workspace work/);
     assert.match(fullInstructions, /pi_research\/pi_review: read-only work/);
     assert.match(fullInstructions, /pi_send: prompt or steer live work/);
@@ -806,6 +845,7 @@ test("the full toolset registers all 20 tools with their current names and core 
     assert.match(fullInstructions, /pi_sessions\/pi_resume_session: find or reopen saved work/);
     assert.match(fullInstructions, /pi_close_session: free a live slot/);
     assert.match(fullInstructions, /Full also provides cancel, history, models, UI responses, compact, fork, and commands/);
+    assert.match(fullInstructions, /host tool visibility may be deferred, so search its catalog/);
     const fullOrder = ["pi_task", "pi_research", "pi_send", "pi_wait", "pi_sessions", "pi_close_session"];
     assert.ok(
       fullOrder.every((name, i) => i === 0 || fullInstructions.indexOf(name) > fullInstructions.indexOf(fullOrder[i - 1])),

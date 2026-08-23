@@ -59,21 +59,33 @@ function errorMessage(error) {
 }
 
 // The service returns the bounded final assistant text on a top-level `answer`
-// channel because compact run snapshots do not carry run.result. Detailed
-// snapshots keep run.result.assistant_text too; either source is accepted so
-// legacy-shaped callers keep working. The final text is emitted only through
-// content[0].text; structuredContent records compact answer metadata instead.
+// channel because compact run snapshots do not carry run.result. The final text
+// is emitted only through content[0].text; structuredContent records compact
+// answer metadata instead.
 function extractAnswer(result) {
   if (result && typeof result === "object") {
     if (typeof result.answer === "string" && result.answer.trim()) {
       return result.answer;
     }
-    const nested = result?.run?.result?.assistant_text;
-    if (typeof nested === "string" && nested.trim()) {
-      return nested;
-    }
   }
   return null;
+}
+
+// Provider/service diagnostics are untrusted and must never smuggle the final
+// assistant answer back into structuredContent, including mocked or legacy
+// service results supplied by callers.
+function stripAssistantText(value) {
+  if (Array.isArray(value)) {
+    return value.map(stripAssistantText);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== "assistant_text")
+      .map(([key, entry]) => [key, stripAssistantText(entry)])
+  );
 }
 
 function stripAnswerChannel(result) {
@@ -145,7 +157,7 @@ function success(summary, result, limit) {
   // The answer is bounded and redacted independently of the snapshot so the
   // compact default never duplicates the full assistant text in the result.
   const bound = boundAnswer(extractAnswer(result), limit);
-  const safe = boundedValue(stripAnswerChannel(result), { maxDepth: 12, maxItems: 160, maxString: limit });
+  const safe = stripAssistantText(boundedValue(stripAnswerChannel(result), { maxDepth: 12, maxItems: 160, maxString: limit }));
   return {
     content: [{
       type: "text",
@@ -301,8 +313,8 @@ export function createPiMcpServer(service) {
     // The edit/read-only distinction stays because it materially affects tool
     // choice; the full-only boundary comes last.
     instructions: toolset === "full"
-      ? "pi_task: one-call workspace work (may edit); pi_research/pi_review: read-only work; pi_send: prompt or steer live work; pi_wait/pi_status: follow a run; pi_sessions/pi_resume_session: find or reopen saved work; pi_close_session: free a live slot. Full also provides cancel, history, models, UI responses, compact, fork, and commands."
-      : "Core toolset (PI_WSL_MCP_TOOLSET=core): pi_task: one-call workspace work (may edit); pi_research/pi_review: read-only work; pi_send: prompt or steer live work; pi_wait/pi_status: follow a run; pi_sessions/pi_resume_session: find or reopen saved work; pi_close_session: free a live slot. Use full for cancel, history, models, UI responses, compact, fork, and commands."
+      ? "pi_task: one-call workspace work (may edit); pi_research/pi_review: read-only work; pi_send: prompt or steer live work; pi_wait/pi_status: follow a run; pi_sessions/pi_resume_session: find or reopen saved work; pi_close_session: free a live slot. Full also provides cancel, history, models, UI responses, compact, fork, and commands; server owns core/full selection, while host tool visibility may be deferred, so search its catalog."
+      : "Core toolset (PI_WSL_MCP_TOOLSET=core): pi_task: one-call workspace work (may edit); pi_research/pi_review: read-only work; pi_send: prompt or steer live work; pi_wait/pi_status: follow a run; pi_sessions/pi_resume_session: find or reopen saved work; pi_close_session: free a live slot. Server owns core/full selection; if a core tool is hidden, search the host deferred catalog; use full plus restart only for advanced tools absent from core."
   });
 
   // Registers the tool only when the selected toolset includes it: core
@@ -488,8 +500,11 @@ export function createPiMcpServer(service) {
 
   registerTool("pi_status", {
     title: "Inspect a live Pi session",
-    description: "Inspect a live session: process and run state, model, thinking level, progress, usage, recent tool activity, cleanup state, and pending extension UI requests.",
-    inputSchema: z.object({ session_id: sessionIdSchema }).strict(),
+    description: "Inspect a live session with a compact process/run snapshot by default. Set include_details for bounded model, protocol, pending-UI, result, and recent-event diagnostics.",
+    inputSchema: z.object({
+      session_id: sessionIdSchema,
+      include_details: z.boolean().optional()
+    }).strict(),
     outputSchema: toolOutputSchema,
     annotations: readOnly
   }, (input) => call(
