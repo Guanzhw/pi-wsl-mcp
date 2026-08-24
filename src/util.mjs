@@ -315,10 +315,9 @@ export function createConfig(environment = process.env) {
     allowedRootInputs: allowedInputs.length > 0 ? allowedInputs : [cwd],
     sessionRootInput: value("SESSION_ROOT") || path.posix.join(home, ".pi", "agent", "sessions"),
     maxSessions: positiveInteger(value("MAX_SESSIONS"), 3, 1, 12),
-    // The public timeout_seconds/wait_seconds acceptance stays compatible through 300,
-    // but the actual blocking wait is capped here, below Codex's tool_timeout_sec=300,
-    // so a wait expiring still has room to return a structured timeout result to the
-    // client before the host kills the tool call.
+    // Advanced pi_wait remains bounded so it can return a continuation before
+    // a conservative host timeout. Synchronous high-level workflows do not use
+    // this limit; they await Pi's settlement event directly.
     maxWaitSeconds: positiveInteger(value("MAX_WAIT_SECONDS"), 285, 5, 295),
     maxSavedSessions: positiveInteger(value("MAX_SAVED_SESSIONS"), 100, 1, 500),
     startupTimeoutMs: positiveInteger(value("STARTUP_TIMEOUT_MS"), 45000, 5000, 120000),

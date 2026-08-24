@@ -11,8 +11,7 @@ import {
   PiWslError,
   readFirstLine,
   redactText,
-  resolveExecutable,
-  sleep
+  resolveExecutable
 } from "./util.mjs";
 import { PiRpcProcess } from "./pi-rpc.mjs";
 
@@ -544,6 +543,22 @@ function jobAnswer(job) {
   return typeof answer === "string" && answer.trim() ? answer : null;
 }
 
+function createCompletion() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve, settled: false };
+}
+
+function resolveCompletion(job) {
+  if (!job?.completion || job.completion.settled || !TERMINAL_JOB_STATES.has(job.status)) {
+    return;
+  }
+  job.completion.settled = true;
+  job.completion.resolve(job);
+}
+
 // Backward-compatible optional run budgets on high-level tools. Each limit is
 // validated positive and bounded; budgets are never defaulted on. A nested
 // budget object with the same meanings is also accepted.
@@ -642,39 +657,6 @@ function checkRunBudget(session) {
   clearBudgetTimer(job);
   job.events.push({ type: "budget_exceeded", limit, at: now() });
   void (session.rpc?.command?.({ type: "abort" }) || Promise.resolve()).catch(() => {});
-}
-
-// Resolve a live session for high-level task reuse. Start-only options
-// (workspace/provider/model/thinking/name) are rejected rather than silently
-// changing the live session, and the live profile must match the profile the
-// calling tool is expected to enforce. A closed/faulted process cannot be
-// reused.
-function resolveReuseTarget(input, expectedProfile, getSession) {
-  for (const key of ["workspace", "provider", "model", "thinking", "name"]) {
-    if (input[key] !== undefined && input[key] !== null && String(input[key]).trim() !== "") {
-      throw new PiWslError(
-        "reuse_conflict",
-        "session_id cannot be combined with " + key + "; reusing a session keeps the live session's own " + key + "."
-      );
-    }
-  }
-  const session = getSession(input.session_id);
-  if (session.lifecycle !== "running") {
-    throw new PiWslError("pi_not_running", "This Pi session is " + session.lifecycle + " and cannot be reused.");
-  }
-  if (session.profile.id !== expectedProfile.id) {
-    throw new PiWslError(
-      "profile_mismatch",
-      "Session " + session.id + " runs the " + session.profile.id + " profile, but this tool requires the " + expectedProfile.id + " profile."
-    );
-  }
-  if (session.job && ACTIVE_JOB_STATES.has(session.job.status)) {
-    throw new PiWslError(
-      "pi_busy",
-      "Session " + session.id + " still has active run " + session.job.id + "; wait for it to settle before reusing the session."
-    );
-  }
-  return session;
 }
 
 function activeProcessCount(sessions) {
@@ -867,7 +849,7 @@ export class PiService {
         }
         session.job.error = error.message;
         session.job.settledAt = now();
-        void this.autoCloseIfSettled(session);
+        resolveCompletion(session.job);
       }
     });
     session.rpc.on("exit", () => {
@@ -885,7 +867,7 @@ export class PiService {
         }
         session.job.error ||= "Pi process exited before the run settled.";
         session.job.settledAt = now();
-        void this.autoCloseIfSettled(session);
+        resolveCompletion(session.job);
       }
     });
   }
@@ -1007,7 +989,7 @@ export class PiService {
       job.cleanupStatus = "failed";
       job.error = error instanceof Error ? error.message : String(error);
     }
-    this.autoCloseIfSettled(session);
+    resolveCompletion(job);
   }
 
   async startSession(input = {}) {
@@ -1120,32 +1102,14 @@ export class PiService {
     bucket.cost += usage.cost;
   }
 
-  // Close the live process once its run reaches a terminal state, when an
-  // auto-close was requested for that run. Returns the close promise (or null
-  // when nothing should close) so callers can await the process teardown; the
-  // promise is also stored on the session so a racing wait() can join it
-  // without closing twice.
-  autoCloseIfSettled(session) {
-    if (!session.autoCloseJobId) {
-      return null;
-    }
-    const job = session.job;
-    if (!job || job.id !== session.autoCloseJobId || !TERMINAL_JOB_STATES.has(job.status)) {
-      return null;
-    }
-    session.autoCloseJobId = null;
-    session.pendingClose = this.close({ session_id: session.id }).catch(() => null);
-    return session.pendingClose;
-  }
-
-  async task(input) {
-    const expectedProfile = profileFor(input.profile || "workspace");
-    const session = input.session_id
-      ? resolveReuseTarget(input, expectedProfile, (id) => this.getSession(id))
-      : this.getSession((await this.startSession(input)).session_id);
-    let dispatched;
+  // Default high-level workflows are synchronous one-shot calls. They own an
+  // ephemeral Pi process, await the run's settlement event, return only the
+  // final answer/error contract, and release the process before returning.
+  async runOnce(input) {
+    const started = await this.startSession(input);
+    const session = this.getSession(started.session_id);
     try {
-      dispatched = await this.send({
+      await this.send({
         session_id: session.id,
         message: input.message,
         behavior: "prompt",
@@ -1154,38 +1118,23 @@ export class PiService {
         max_cost: input.max_cost,
         budget: input.budget
       });
-    } catch (error) {
-      if (input.auto_close) {
-        session.autoCloseJobId = session.job?.id ?? null;
-        await this.autoCloseIfSettled(session);
+      const job = session.job;
+      if (job && ACTIVE_JOB_STATES.has(job.status)) {
+        await job.completion.promise;
       }
-      throw error;
+      return {
+        status: job?.status === "settled" ? "completed" : "failed",
+        answer: jobAnswer(job),
+        error: job?.status === "error" ? job.error || "Pi run failed." : null
+      };
+    } finally {
+      try {
+        await this.close({ session_id: session.id });
+      } catch {
+        // A process that failed or exited while producing the terminal result
+        // may already be closed.
+      }
     }
-    if (input.auto_close) {
-      session.autoCloseJobId = session.job?.id ?? null;
-      await this.autoCloseIfSettled(session);
-    }
-    if (input.wait_seconds && input.wait_seconds > 0) {
-      return this.wait({
-        session_id: session.id,
-        run_id: dispatched.run_id,
-        timeout_seconds: input.wait_seconds,
-        include_details: input.include_details,
-        auto_close: input.auto_close
-      });
-    }
-    const job = session.job;
-    const runId = job ? job.id : dispatched.run_id;
-    return {
-      answer: jobAnswer(job),
-      session_id: session.id,
-      run_id: runId,
-      session: this.liveSummary(session, false),
-      run: input.include_details
-        ? jobSnapshot(job, { includeDetails: true })
-        : dispatched,
-      continuation: continuationFor(session.id, runId)
-    };
   }
 
   async send(input) {
@@ -1202,8 +1151,6 @@ export class PiService {
           "Pi is still working. Use behavior=steer or behavior=follow_up, or wait for run " + existing.id + "."
         );
       }
-      session.autoCloseJobId = null;
-      session.pendingClose = null;
       const job = {
         id: createId("run"),
         status: "accepted",
@@ -1220,6 +1167,7 @@ export class PiService {
         messageUpdates: 0,
         result: null,
         error: null,
+        completion: createCompletion(),
         stats: {
           modelCalls: 0,
           tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
@@ -1239,6 +1187,7 @@ export class PiService {
           job.cleanupStatus = "failed";
           job.error = message;
           job.settledAt = now();
+          resolveCompletion(job);
         }
         const code = error instanceof PiWslError ? error.code : "prompt_failed";
         const priorDetails = error instanceof PiWslError &&
@@ -1292,21 +1241,18 @@ export class PiService {
     const requestedSeconds = input.timeout_seconds ?? 120;
     const effectiveSeconds = Math.max(0, Math.min(requestedSeconds, maxWaitSeconds));
     const clamped = requestedSeconds > effectiveSeconds;
-    const timeoutMs = effectiveSeconds * 1000;
-    const deadline = Date.now() + timeoutMs;
-    while (ACTIVE_JOB_STATES.has(job.status) && Date.now() < deadline) {
-      checkRunBudget(session);
-      await sleep(Math.min(350, Math.max(25, deadline - Date.now())));
-    }
-    if (input.auto_close && TERMINAL_JOB_STATES.has(job.status)) {
-      // Join the close already triggered by autoCloseIfSettled (either just
-      // now, or deferred from an earlier timeout) instead of closing twice.
-      const pending = this.autoCloseIfSettled(session) || session.pendingClose || null;
-      if (pending) {
-        try {
-          await pending;
-        } catch (error) {
-          // A racing deferred auto-close may already be tearing the process down.
+    if (ACTIVE_JOB_STATES.has(job.status) && effectiveSeconds > 0) {
+      let timeout;
+      try {
+        await Promise.race([
+          job.completion?.promise || Promise.resolve(),
+          new Promise((resolve) => {
+            timeout = setTimeout(resolve, effectiveSeconds * 1000);
+          })
+        ]);
+      } finally {
+        if (timeout) {
+          clearTimeout(timeout);
         }
       }
     }

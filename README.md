@@ -71,15 +71,17 @@ For the concrete configuration and naming migration, see
 
 - A convenient pi_task entry point for ordinary workspace work.
 - Read-only pi_research and pi_review for focused research and review.
-- Long-running task control: pi_send (including `behavior=steer`), pi_wait,
-  pi_status, and pi_cancel.
+- Synchronous one-shot execution for the three ordinary workflows: one MCP
+  call waits for Pi's final answer and then closes its temporary process.
+- Explicit advanced controls for deliberately background or persistent work:
+  pi_send, pi_wait, pi_status, and pi_cancel.
 - Persistent Pi sessions: list, close, inspect history, and resume saved
   sessions across MCP restarts.
 - Pi model, thinking-level, compact, fork, and extension-command controls.
 - Delivery of genuinely interactive Pi extension requests through
   pi_respond_ui.
-- Answer-first compact results with optional diagnostics and explicit
-  machine-readable operation/run state.
+- Minimal high-level results: the answer appears once, with only terminal
+  success/failure state in structured output.
 
 ## Toolset: core and full
 
@@ -89,22 +91,18 @@ than silently falling back.
 
 | Value | Surface | Intended use |
 | --- | --- | --- |
-| `core` (default) | The 9 daily-agent workflow tools: pi_task, pi_research, pi_review, pi_send, pi_wait, pi_status, pi_sessions, pi_resume_session, pi_close_session | Ordinary daily work: start work, follow it, reopen saved sessions, stop live processes |
-| `full` | The complete 20-tool surface: the 9 core tools plus pi_info, pi_start_session, pi_cancel, pi_respond_ui, pi_history, pi_models, pi_set_model, pi_set_thinking, pi_compact, pi_fork, pi_commands | Diagnostics and advanced session controls |
+| `core` (default) | pi_task, pi_research, pi_review | Synchronous one-shot implementation, research, and review |
+| `full` | The three synchronous tools plus 17 explicit session, background, continuation, UI, and diagnostic controls | Deliberately persistent or background work and troubleshooting |
 
-`full` registers the existing 20 tools with their current names and
-behavior; nothing is renamed or weakened by the toolset switch. `core`
-keeps the same server identity and the same read-only `research`/`review`
-profiles - only the MCP tool registration is reduced. The server
-instructions describe exactly the registered surface, and every returned
-continuation (`pi_wait`/`pi_status`) stays usable because both tools exist
-in every toolset. `PI_LOCAL_MCP_TOOLSET` remains a deprecated alias with
-identical meaning; when both are set, `PI_WSL_MCP_TOOLSET` wins.
+The three high-level tools have the same synchronous behavior in both
+toolsets. They never silently degrade into a continuation workflow. `full`
+adds the existing low-level lifecycle tools for callers that intentionally
+manage sessions or background runs. `PI_LOCAL_MCP_TOOLSET` remains a
+deprecated alias; when both are set, `PI_WSL_MCP_TOOLSET` wins.
 
-`core` is the default so hosts get a lean tool list for ordinary agent
-work. Choose `full` when you need session diagnostics, cancellation,
-extension UI responses, history, model/thinking switching, compact, fork,
-start-session, or extension-command controls:
+Choose `full` only when you need explicit background work, session reuse,
+diagnostics, cancellation, extension UI responses, history, model/thinking
+switching, compact, fork, start-session, or extension-command controls:
 
     PI_WSL_MCP_TOOLSET=full
 
@@ -153,8 +151,8 @@ the selected workspace.
 | One-off implementation or investigation | pi_task |
 | Web research using the installed DeepSeek search extension | pi_research |
 | Evidence-based, read-only review | pi_review |
-| Follow a long task | pi_wait, then pi_status |
-| Redirect a running task | pi_send with behavior steer |
+| Deliberately run in the background (`full`) | pi_start_session, pi_send, then one pi_wait |
+| Redirect an explicit background task (`full`) | pi_send with behavior steer |
 | Reopen past work | pi_sessions, then pi_resume_session |
 | Continue or inspect a live session | pi_send, pi_history, pi_commands |
 | Handle an extension confirmation/input dialog | pi_status, then pi_respond_ui |
@@ -163,41 +161,16 @@ The bridge reports a logical session_id for its live process and Pi's own
 durable pi_session_id. After a restart, use the durable identifier returned
 by pi_sessions with pi_resume_session.
 
-High-level calls (pi_task, pi_research, pi_review, pi_wait) return compact
-results by default. The final Pi text appears exactly once, in
-`content[0].text`, prefixed with an `untrusted` marker and followed by a very
-short status line plus session/run references; `structuredContent` carries no
-copy of the answer. `structuredContent.success` reports whether the MCP
-operation itself succeeded, including successful directory/control calls that
-do not produce an answer; accepted operation errors keep their structured
-snapshot with `success: false` and `isError: true`, while plain rejected errors
-carry no structured content. A successful call can still report an errored or
-budget-exhausted Pi run, so callers must also inspect `result.run.status` and
-`result.run.error`. `structuredContent.answer_meta` records machine facts about
-the optional generated answer (`has_answer`, `truncated`, `original_chars`), and
-`structuredContent.result` carries the run summary needed to continue
-(session/run ids at the top level, status, error, timing, pending extension
-UI requests) without duplicating the assistant text or replaying tool/event
-history. `PI_WSL_MCP_RESULT_LIMIT` bounds the final answer and every nested
-diagnostic string; truncation is always reported (`truncated: true` in
-answer_meta and an explicit `… [truncated]` marker in the text). Compact run
-summaries also carry `progress`
-(a coarse phase - starting/model_working/model_awaiting_input/cleanup/
-cancelling/settled/error - that explicitly distinguishes model work from
-extension cleanup and final collection, the last_activity_at timestamp, and
-`model_status` (idle/running/stopped/failed) plus `cleanup_status`
-(pending/running/completed/failed) as separate lifecycle axes from run
-settlement, and the latest tool name/status with a safe path/file target when
-known; no ETA is ever invented) and compact `stats` (elapsed_ms, model_calls
-counted from real assistant `message_end` events exactly once,
-input/output/cache read/cache write/reasoning/total token usage counters under
-`usage`, cost, and a bounded provider/model breakdown). Pass
-`include_details: true` to those tools to restore the full bounded diagnostic
-run snapshot (recent tool events, streamed message counts, and other
-diagnostics; the assistant text is never copied into a structured snapshot).
-Calls
-without an answer - for example a timed-out wait - end with a concise summary
-plus session/run references instead of a payload dump.
+pi_task, pi_research, and pi_review synchronously wait for terminal settlement.
+Their temporary Pi process is closed before the MCP call returns. The final Pi
+text appears exactly once in `content[0].text`; structured output contains only
+`status: completed|failed` and the untrusted-content marker. It never includes
+session ids, run ids, continuation arguments, usage, timing, event history, or
+another copy of the answer. Use the `full` toolset's lifecycle and diagnostic
+tools only when those details are intentionally needed.
+`PI_WSL_MCP_RESULT_LIMIT` bounds the answer and adds an explicit
+`… [truncated]` marker. Advanced status/wait tools retain bounded progress,
+usage, lifecycle, and optional diagnostic snapshots for troubleshooting.
 `pi_sessions` returns a minimal session directory by default: live entries
 carry only session_id, lifecycle with an explicit `process_status` (the
 process state, kept separate from the run state in active_run), workspace,
@@ -218,42 +191,35 @@ and job snapshot by default (without `result`, `recent_events`, or
 `tool_calls`); pass `include_details: true` for bounded diagnostics. The
 final assistant answer has one carrier only: `content[0].text`.
 
-### Timeouts, continuation, and optional budgets
+### Synchronous completion, advanced continuation, and optional budgets
 
-pi_task/pi_review/pi_research accept `wait_seconds` and pi_wait accepts
-`timeout_seconds`; both stay schema-compatible through 300, but the actual
-blocking wait is capped at a configurable margin (default 285 seconds,
-`PI_WSL_MCP_MAX_WAIT_SECONDS`) so an expiring wait always returns to the
-client before Codex's tool_timeout_sec=300 kills the call. When a requested
-wait is clamped, the result carries `wait` metadata
-({requested_seconds, effective_seconds, clamped, max_seconds}) so the
-behavior is transparent. A wait that expires because the run is still active
-never throws: it returns a normal structured result with `timed_out: true`,
-top-level `session_id` and `run_id`, the current process state
-(session.process_status) and run state (run.status/model_status/cleanup_status),
-and a directly reusable `continuation` object
-({pi_wait: {session_id, run_id}, pi_status: {session_id}}) - every accepted
-task, wait, send, and cancel result carries the same ids and continuation, and
-error/timeout messaging never drops them. Settled calls stay answer-first.
+pi_task, pi_review, and pi_research have no `wait_seconds`, `session_id`,
+`auto_close`, or `include_details` arguments. They wait on Pi's
+`agent_settled` event and final-answer collection through one event-driven
+Promise; no status polling occurs. Configure the MCP host timeout generously
+enough for the intended workload.
+
+In the `full` toolset, pi_wait remains available for explicitly background
+runs created through the low-level session tools. It waits on the same
+settlement Promise and uses `timeout_seconds` only as an advanced continuation
+boundary. Its 285-second default transport margin does not affect synchronous
+high-level calls.
 
 All three high-level tools also accept optional, never-defaulted-on budgets:
 `max_elapsed_seconds`, `max_model_calls`, and `max_cost` (a nested `budget`
 object with the same keys is also accepted). Each is validated positive and
-bounded. When a limit fires during a run, the bridge requests cancellation
-exactly once, moves the run to cancelling, and reports `budget_exceeded`
-(which limit fired) plus the effective limits under `budget` in the run
-snapshot; the run then settles through the normal agent_settled -> collection
-path without repeated cancels.
+bounded. When a limit fires, the bridge requests cancellation exactly once and
+still waits for terminal settlement. High-level output reports only the final
+failure; the `full` diagnostic tools expose the detailed budget snapshot.
 
 When a budget limit fires before Pi produced any final answer, the run ends
 as an `error` run - it is never reported as a settled success - and the
 user-facing result text says so explicitly: which limit fired, that the run
 was cancelled without an answer, and how to retry (drop the limit, or
 increase it; `max_model_calls` is a count of billed assistant messages, so a
-longer task legitimately needs a higher number). The effective `budget`
-fields and `budget_exceeded` stay in the structured result for automation,
-and raw provider text is never included. Runs that finish with a final
-answer despite the cancellation are reported normally with that answer.
+longer task legitimately needs a higher number). Raw provider text is never
+included. Runs that finish with a final answer despite cancellation are
+reported normally with that answer.
 
 ### Streaming and lifecycle consistency
 
@@ -264,11 +230,9 @@ last assistant message carries `stop_reason=error` (for example the DeepSeek
 400 conflict above), a run that settles without any collectable answer text,
 and a run whose final collection fails are all reported as `error` runs with
 a redacted, actionable message in `run.error` and `stop_reason` in the run
-snapshot - the bridge never reports an empty `settled` answer. `pi_task`,
-`pi_review`, and `pi_research` return such runs through the normal
-structured error path (with `isError: true` when the failure is detected
-synchronously, or `run.status === "error"` after a wait) and always keep the
-session/run ids and continuation needed to retry or inspect.
+snapshot - the bridge never reports an empty `settled` answer. The three
+high-level tools return a minimal `status: failed` result with `isError: true`;
+they do not expose session/run ids or continuation data.
 
 Once the active run is terminal, `is_streaming` is reported as false even if
 Pi's own state is stale; the session process may keep running, which is the
@@ -281,26 +245,14 @@ collection or failed on collection errors. Non-interactive extension status
 notifications (setStatus/notify/setWidget) are fire-and-forget: they are never
 stored as pending UI requests and can never reopen or block a completed run.
 
-### Reusing a live session and closing after a task
+### Persistent and background sessions
 
-pi_task, pi_review, and pi_research accept an optional `session_id` to reuse a
-live settled session instead of starting a new process. Reuse keeps the
-session's own workspace, profile, provider, model, thinking level, and name;
-passing any of those start-only options together with `session_id` is
-rejected (reuse_conflict) rather than silently changed, and the live session
-must already run the profile the tool expects (pi_task -> workspace,
-pi_review -> review, pi_research -> research) or the call fails with
-profile_mismatch. Read-only isolation is inherited from the reused process, so
-a review or research session stays read-only. auto_close may be combined with
-reuse.
-
-All three tools also accept `auto_close: true` to close the bridge process as
-soon as the run reaches a terminal state (settled or error), including
-completion that happens after an initial wait timeout. The process is closed
-even when the prompt or result collection fails, so auto-close never leaks a
-process. Closing preserves Pi's durable pi_session_id and transcript (list it
-later with pi_sessions and reopen with pi_resume_session) and frees the
-live-session quota.
+High-level calls are deliberately ephemeral. For a persistent conversation or
+background task, select `full` and use pi_start_session plus pi_send. Follow it
+with a single pi_wait when the final answer is needed; use pi_status only for
+explicit diagnostics or interactive UI handling. Close the live process with
+pi_close_session when finished. These controls never appear in the default
+core surface.
 
 `pi_review` deliberately defaults to DeepSeek Pro for stronger review quality.
 `pi_research` leaves its model unset so Pi can use its own current default;
@@ -425,9 +377,12 @@ A user-level Codex entry, for example in `C:\Users\<you>\.codex\config.toml`:
     command = "cmd"
     args = ["/d", "/s", "/c", 'C:\path\to\pi-wsl-mcp\run-pi-wsl-mcp.cmd']
     startup_timeout_sec = 60.0
-    tool_timeout_sec = 300.0
+    tool_timeout_sec = 3600.0
 
 Restart Codex (or start a new Codex session) after changing its configuration.
+The one-hour tool timeout is a transport ceiling for synchronous Pi work, not
+a default task budget. Use `max_elapsed_seconds`, `max_model_calls`, or
+`max_cost` when a workload needs an explicit limit.
 Replace any previous `[mcp_servers.pi_local]` entry with the `pi_wsl` name
 shown above. If the bridge is moved, only the launcher path in this entry
 changes - nothing inside the checkout references its own location.
@@ -451,13 +406,13 @@ arbitrary user can run the bridge with zero setup.
 | PI_WSL_MCP_ALLOWED_ROOTS | bridge working directory | Semicolon-separated allowed workspace roots |
 | PI_WSL_MCP_SESSION_ROOT | $HOME/.pi/agent/sessions | Pi's saved-session store |
 | PI_WSL_MCP_MAX_SESSIONS | 3 | Concurrent live Pi processes |
-| PI_WSL_MCP_MAX_WAIT_SECONDS | 285 | Cap for pi_wait/pi_task wait blocking, kept below Codex's 300s tool timeout |
+| PI_WSL_MCP_MAX_WAIT_SECONDS | 285 | Advanced pi_wait continuation boundary; it does not limit synchronous high-level calls |
 | PI_WSL_MCP_STARTUP_TIMEOUT_MS | 45000 | Pi startup acknowledgement timeout |
 | PI_WSL_MCP_COMMAND_TIMEOUT_MS | 30000 | Individual Pi RPC acknowledgement timeout |
 | PI_WSL_MCP_MAX_SAVED_SESSIONS | 100 | Saved sessions returned by pi_sessions at most |
 | PI_WSL_MCP_RESULT_LIMIT | 24000 | Bounds the final Pi answer in `content[0].text` and every nested diagnostic string; truncation is explicit |
 | PI_WSL_MCP_HISTORY_LIMIT | 80 | Bounded history entry count |
-| PI_WSL_MCP_TOOLSET | `core` | MCP tool surface: `core` registers the 9 daily-agent workflow tools; `full` registers the complete 20-tool surface. Invalid values are rejected at startup |
+| PI_WSL_MCP_TOOLSET | `core` | MCP tool surface: `core` registers 3 synchronous expert tools; `full` registers all 20 tools. Invalid values are rejected at startup |
 | PI_WSL_MCP_LAUNCH | (launcher sets it) | Guard flag for interactive rc-file banners |
 | PI_WSL_MCP_DISTRO | (unset) | WSL distro name used by the Windows launcher; default distro when unset |
 
@@ -540,8 +495,8 @@ closes live bridge sessions while preserving Pi's durable transcripts.
 
 ## Development notes
 
-- The 20-tool MCP surface (`full` toolset), the default 9-tool `core`
-  toolset, protocol compatibility (initialization-based and stateless
+- The 20-tool MCP surface (`full` toolset), the default 3-tool synchronous
+  `core` surface, protocol compatibility (initialization-based and stateless
   `2026-07-28`), read-only profile allowlists, redaction, bounded payloads,
   and allowed-root containment are behavior contracts; keep them intact when
   changing the bridge.

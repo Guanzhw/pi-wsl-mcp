@@ -118,6 +118,7 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
     setTimeout(() => {
       job.status = "settled";
       job.settledAt = new Date().toISOString();
+      job.completion.resolve(job);
     }, ms);
   };
   const service = {
@@ -128,6 +129,8 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
   service.getSession = () => currentSession;
 
   const job = activeJob();
+  job.completion = {};
+  job.completion.promise = new Promise((resolve) => { job.completion.resolve = resolve; });
   settleSoon(job);
   currentSession = { id: "session-1", job };
   const result = await PiService.prototype.wait.call(service, {
@@ -151,6 +154,8 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
   });
 
   const customJob = activeJob();
+  customJob.completion = {};
+  customJob.completion.promise = new Promise((resolve) => { customJob.completion.resolve = resolve; });
   settleSoon(customJob);
   currentSession = { id: "session-1", job: customJob };
   const custom = await PiService.prototype.wait.call(service, {
@@ -161,6 +166,8 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
   assert.equal(custom.wait.effective_seconds, 285, "the configured margin is the cap");
 
   const freeJob = activeJob();
+  freeJob.completion = {};
+  freeJob.completion.promise = new Promise((resolve) => { freeJob.completion.resolve = resolve; });
   settleSoon(freeJob);
   currentSession = { id: "session-1", job: freeJob };
   const free = await PiService.prototype.wait.call(service, {
@@ -170,7 +177,6 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
   });
   assert.equal(free.wait, undefined, "waits under the cap are never flagged as clamped");
 });
-
 test("status defaults to a compact live/job snapshot and opts into bounded diagnostics", async () => {
   const session = {
     id: "session-1",
@@ -251,7 +257,6 @@ test("agent_end stops the model while cleanup stays pending until agent_settled 
   };
   const service = Object.create(PiService.prototype);
   service.config = { commandTimeoutMs: 1000 };
-  service.autoCloseIfSettled = () => null;
 
   service.handleEvent(session, { type: "agent_start" });
   assert.equal(job.status, "running");
@@ -315,7 +320,6 @@ test("late non-interactive status notifications never reopen or block a run", as
   };
   const service = Object.create(PiService.prototype);
   service.config = { commandTimeoutMs: 1000 };
-  service.autoCloseIfSettled = () => null;
 
   service.handleEvent(session, {
     type: "extension_ui_request",
@@ -353,7 +357,6 @@ test("elapsed budget fires once and requests a single cancel", async () => {
   };
   const service = Object.create(PiService.prototype);
   service.config = { commandTimeoutMs: 1000 };
-  service.autoCloseIfSettled = () => null;
 
   service.handleEvent(session, { type: "tool_execution_start", toolCallId: "t1", toolName: "read" });
   service.handleEvent(session, { type: "tool_execution_start", toolCallId: "t2", toolName: "grep" });
@@ -372,8 +375,6 @@ test("elapsed budget fires without an event stream or active waiter", async () =
     id: "session-silent",
     lifecycle: "running",
     job: null,
-    autoCloseJobId: null,
-    pendingClose: null,
     uiRequests: new Map(),
     rpc: {
       command: async (command) => {
@@ -412,7 +413,6 @@ test("model-call budget fires once and cost budget fires once", async () => {
     };
     const service = Object.create(PiService.prototype);
     service.config = { commandTimeoutMs: 1000 };
-    service.autoCloseIfSettled = () => null;
     return { service, session, aborts };
   };
   const usage = { role: "assistant", provider: "deepseek", model: "m", usage: { input: 2, output: 2, totalTokens: 4, cost: { total: 0.01 } } };
@@ -468,33 +468,6 @@ test("job snapshots expose optional budgets and the fired limit", async () => {
   const snapshot = jobSnapshot(job);
   assert.deepEqual(snapshot.budget, { max_elapsed_seconds: 60, max_model_calls: 5, max_cost: null });
   assert.equal(snapshot.budget_exceeded, "model_calls");
-});
-
-test("task honors requested details without waiting", async () => {
-  const job = settledJob();
-  const session = { id: "session-1", job };
-  const service = {
-    startSession: async () => ({ session_id: "session-1" }),
-    send: async () => jobSnapshot(job),
-    getSession: () => session,
-    liveSummary: () => ({ session_id: "session-1" })
-  };
-
-  const compact = await PiService.prototype.task.call(service, {
-    message: "Inspect the package.",
-    wait_seconds: 0
-  });
-  assert.equal(compact.run.result, undefined);
-  assert.equal(compact.run.recent_events, undefined);
-
-  const detailed = await PiService.prototype.task.call(service, {
-    message: "Inspect the package.",
-    wait_seconds: 0,
-    include_details: true
-  });
-  assert.equal(detailed.run.result, null, "the final answer stays in the answer carrier only");
-  assert.equal(detailed.run.result?.assistant_text, undefined);
-  assert.equal(detailed.run.recent_events.length, 1);
 });
 
 test("live directory entries are minimal and expose active_run only when a job exists", () => {
@@ -979,54 +952,30 @@ test("live directory entries expose an explicit process_status alongside lifecyc
   assert.equal(liveDirectoryEntry({ ...busy, lifecycle: "faulted" }).process_status, "faulted");
 });
 
-test("auto_close closes the process once the run settles, exactly once", async () => {
-  const job = activeJob({ status: "collecting" });
-  const session = { id: "session-1", lifecycle: "running", job, autoCloseJobId: "run-1", uiRequests: new Map() };
-  let closed = 0;
-  const service = {
-    close: async () => {
-      closed += 1;
-      session.lifecycle = "closed";
-      return { session_id: session.id, closed: true };
-    }
-  };
-  assert.equal(await PiService.prototype.autoCloseIfSettled.call(service, session), null, "still collecting -> no close");
-  job.status = "settled";
-  await PiService.prototype.autoCloseIfSettled.call(service, session);
-  assert.equal(closed, 1);
-  assert.equal(session.autoCloseJobId, null);
-  assert.equal(session.lifecycle, "closed");
-  await PiService.prototype.autoCloseIfSettled.call(service, session);
-  assert.equal(closed, 1, "auto-close must fire exactly once");
-});
-
-test("unexpected process exit settles the run and clears deferred auto_close state", async () => {
+test("unexpected process exit settles and releases an event-driven waiter", async () => {
   const handlers = new Map();
   const job = activeJob();
+  let resolveCompletion;
+  job.completion = {
+    settled: false,
+    promise: new Promise((resolve) => { resolveCompletion = resolve; }),
+    resolve: (value) => resolveCompletion(value)
+  };
   const session = {
     id: "session-1",
     lifecycle: "running",
     profile: { id: "workspace" },
     job,
-    autoCloseJobId: job.id,
-    pendingClose: null,
     uiRequests: new Map(),
     rpc: { on: (name, handler) => handlers.set(name, handler) }
   };
-  let closed = 0;
   const service = Object.create(PiService.prototype);
-  service.close = async () => {
-    closed += 1;
-    session.lifecycle = "closed";
-    return { closed: true };
-  };
   service.attach(session);
   handlers.get("exit")();
-  await session.pendingClose;
+  await job.completion.promise;
   assert.equal(job.status, "error");
   assert.match(job.error, /exited before the run settled/);
-  assert.equal(session.autoCloseJobId, null);
-  assert.equal(closed, 1);
+  assert.equal(job.completion.settled, true);
 });
 
 test("read-only profiles exclude the search function tool and keep the navigation tools", () => {
@@ -1108,7 +1057,6 @@ test("agent_settled with stop_reason=error ends the run as an actionable error",
   };
   const service = Object.create(PiService.prototype);
   service.config = { commandTimeoutMs: 1000 };
-  service.autoCloseIfSettled = () => null;
 
   service.handleEvent(session, {
     type: "message_end",
@@ -1140,7 +1088,6 @@ test("agent_settled without a collectable answer is an error, never an empty set
   };
   const service = Object.create(PiService.prototype);
   service.config = { commandTimeoutMs: 1000 };
-  service.autoCloseIfSettled = () => null;
 
   service.handleEvent(session, { type: "agent_start" });
   service.handleEvent(session, { type: "agent_end" });
@@ -1166,7 +1113,6 @@ test("a budget-exhausted run without a final answer gets an explicit budget erro
   };
   const service = Object.create(PiService.prototype);
   service.config = { commandTimeoutMs: 1000 };
-  service.autoCloseIfSettled = () => null;
 
   service.handleEvent(session, { type: "agent_start" });
   service.handleEvent(session, { type: "agent_end" });
@@ -1194,7 +1140,6 @@ test("a settled run with a real answer and no error stop reason stays settled", 
   };
   const service = Object.create(PiService.prototype);
   service.config = { commandTimeoutMs: 1000 };
-  service.autoCloseIfSettled = () => null;
 
   service.handleEvent(session, {
     type: "message_end",
@@ -1209,79 +1154,11 @@ test("a settled run with a real answer and no error stop reason stays settled", 
   assert.equal(job.result.assistant_text, "the official site is https://modelcontextprotocol.io");
 });
 
-test("collectFinalResult closes an auto-close session on settlement and on collection errors", async () => {
-  const job = activeJob({ status: "collecting" });
-  const session = { id: "session-1", lifecycle: "running", job, autoCloseJobId: "run-1", uiRequests: new Map() };
-  let closed = 0;
-  const service = {
-    config: { commandTimeoutMs: 1000 },
-    autoCloseIfSettled: PiService.prototype.autoCloseIfSettled,
-    close: async () => {
-      closed += 1;
-      session.lifecycle = "closed";
-    }
-  };
-  session.rpc = { command: async () => ({ data: { text: "done" } }) };
-  await PiService.prototype.collectFinalResult.call(service, session, job);
-  assert.equal(job.status, "settled");
-  assert.equal(closed, 1);
-  assert.equal(session.lifecycle, "closed");
-
-  const failing = activeJob({ status: "collecting" });
-  const failingSession = { id: "session-2", lifecycle: "running", job: failing, autoCloseJobId: failing.id, uiRequests: new Map() };
-  failingSession.rpc = { command: async () => { throw new Error("collection exploded"); } };
-  let closedFailing = 0;
-  const failingService = {
-    config: { commandTimeoutMs: 1000 },
-    autoCloseIfSettled: PiService.prototype.autoCloseIfSettled,
-    close: async () => {
-      closedFailing += 1;
-      failingSession.lifecycle = "closed";
-    }
-  };
-  await PiService.prototype.collectFinalResult.call(failingService, failingSession, failing);
-  assert.equal(failing.status, "error");
-  assert.equal(closedFailing, 1, "a collection error with auto_close must still close the process");
-  assert.equal(failingSession.lifecycle, "closed");
-  assert.equal(failingSession.autoCloseJobId, null);
-});
-
-test("task with auto_close closes the process when the prompt fails", async () => {
-  const job = activeJob({ status: "accepted" });
-  const session = { id: "session-1", lifecycle: "running", profile: { id: "workspace" }, job, autoCloseJobId: null, uiRequests: new Map() };
-  let closed = 0;
-  const service = {
-    startSession: async () => ({ session_id: session.id }),
-    getSession: () => session,
-    liveSummary: () => ({ session_id: session.id, lifecycle: session.lifecycle }),
-    autoCloseIfSettled: PiService.prototype.autoCloseIfSettled,
-    close: async () => {
-      closed += 1;
-      session.lifecycle = "closed";
-      return { closed: true };
-    },
-    send: async () => {
-      job.status = "error";
-      job.error = "prompt rejected";
-      job.settledAt = "2026-08-01T00:00:01.000Z";
-      throw new Error("prompt rejected");
-    }
-  };
-  await assert.rejects(
-    PiService.prototype.task.call(service, { message: "go", auto_close: true }),
-    /prompt rejected/
-  );
-  assert.equal(closed, 1, "a failed prompt with auto_close must not leak the process");
-  assert.equal(session.lifecycle, "closed");
-});
-
 test("a rejected prompt preserves accepted session and run ids on the error", async () => {
   const session = {
     id: "session-accepted",
     lifecycle: "running",
     job: null,
-    autoCloseJobId: null,
-    pendingClose: null,
     uiRequests: new Map(),
     rpc: {
       command: async () => {
@@ -1317,129 +1194,34 @@ test("a rejected prompt preserves accepted session and run ids on the error", as
   );
 });
 
-test("task with auto_close defers closing until a run settles after a timeout", async () => {
-  const job = activeJob({ status: "collecting" });
-  const session = { id: "session-1", lifecycle: "running", profile: { id: "workspace" }, job, autoCloseJobId: null, uiRequests: new Map() };
-  let closed = 0;
+test("runOnce waits for settlement without polling and closes the ephemeral session", async () => {
+  let resolveCompletion;
+  const job = activeJob();
+  job.completion = {
+    promise: new Promise((resolve) => { resolveCompletion = resolve; })
+  };
+  const session = { id: "session-sync", job };
+  const calls = [];
   const service = {
     startSession: async () => ({ session_id: session.id }),
     getSession: () => session,
-    liveSummary: () => ({ session_id: session.id, lifecycle: session.lifecycle }),
-    autoCloseIfSettled: PiService.prototype.autoCloseIfSettled,
-    close: async () => {
-      closed += 1;
-      session.lifecycle = "closed";
-    },
     send: async () => {
-      job.status = "accepted";
-      return jobSnapshot(job);
-    }
-  };
-  const dispatched = await PiService.prototype.task.call(service, { message: "go", auto_close: true, wait_seconds: 0 });
-  assert.equal(dispatched.run.status, "accepted");
-  assert.equal(closed, 0, "a still-running run must not be closed early");
-  assert.equal(session.autoCloseJobId, "run-1", "the deferred close must be registered");
-  job.status = "settled";
-  await PiService.prototype.autoCloseIfSettled.call(service, session);
-  assert.equal(closed, 1, "the deferred close must fire once the run settles");
-  assert.equal(session.lifecycle, "closed");
-});
-
-test("task with auto_close and a requested wait closes before returning", async () => {
-  const job = activeJob({ status: "settled", settledAt: "2026-08-01T00:01:00.000Z" });
-  const session = { id: "session-1", lifecycle: "running", profile: { id: "workspace" }, job, autoCloseJobId: null, uiRequests: new Map() };
-  let closed = 0;
-  const service = {
-    startSession: async () => ({ session_id: session.id }),
-    getSession: () => session,
-    liveSummary: () => ({ session_id: session.id, lifecycle: session.lifecycle }),
-    autoCloseIfSettled: PiService.prototype.autoCloseIfSettled,
-    close: async () => {
-      closed += 1;
-      session.lifecycle = "closed";
-      return { closed: true };
+      calls.push("send");
+      queueMicrotask(() => {
+        job.status = "settled";
+        job.result = { assistant_text: "Final synchronous answer." };
+        resolveCompletion(job);
+      });
+      return { run_id: job.id };
     },
-    send: async () => jobSnapshot(job),
-    wait: PiService.prototype.wait
+    close: async () => { calls.push("close"); }
   };
-  const result = await PiService.prototype.task.call(service, { message: "go", auto_close: true, wait_seconds: 30 });
-  assert.equal(result.run.status, "settled");
-  assert.equal(closed, 1, "task and wait must close the process exactly once between them");
-  assert.equal(session.lifecycle, "closed", "the wait result must already reflect the closed process");
-});
 
-test("task reuse requires the expected profile and rejects start-only options", async () => {
-  const session = { id: "session-1", lifecycle: "running", profile: { id: "review" }, job: null, uiRequests: new Map() };
-  const service = {
-    getSession: () => session,
-    startSession: async () => { throw new Error("reuse must never start a session"); },
-    send: async () => jobSnapshot(activeJob({ status: "accepted" })),
-    liveSummary: () => ({ session_id: session.id })
-  };
-  await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", provider: "deepseek" }),
-    /cannot be combined with provider/
-  );
-  await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", model: "deepseek-v4-pro" }),
-    /cannot be combined with model/
-  );
-  await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", workspace: "/home/user/work" }),
-    /cannot be combined with workspace/
-  );
-  await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", thinking: "high" }),
-    /cannot be combined with thinking/
-  );
-  await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", name: "named" }),
-    /cannot be combined with name/
-  );
-  await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", profile: "workspace" }),
-    /requires the workspace profile/
-  );
-  session.job = activeJob();
-  await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-1", message: "go", profile: "review" }),
-    /wait for it to settle/
-  );
-  session.job = null;
-  const accepted = await PiService.prototype.task.call(service, {
-    session_id: "session-1",
-    message: "go",
-    profile: "review",
-    wait_seconds: 0
+  const result = await PiService.prototype.runOnce.call(service, { message: "review" });
+  assert.deepEqual(result, {
+    status: "completed",
+    answer: "Final synchronous answer.",
+    error: null
   });
-  assert.equal(accepted.run.run_id, "run-1");
-});
-
-test("task reuse rejects non-running sessions and accepts auto_close", async () => {
-  const closedSession = { id: "session-2", lifecycle: "closed", profile: { id: "research" }, job: null, uiRequests: new Map() };
-  let sent = 0;
-  let liveSession;
-  const service = {
-    getSession: (id) => (id === "session-2" ? closedSession : liveSession),
-    startSession: async () => { throw new Error("reuse must never start a session"); },
-    send: async () => {
-      sent += 1;
-      liveSession.job = activeJob({ status: "accepted" });
-      return jobSnapshot(liveSession.job);
-    },
-    liveSummary: () => ({ session_id: liveSession.id })
-  };
-  await assert.rejects(
-    PiService.prototype.task.call(service, { session_id: "session-2", message: "go", profile: "research" }),
-    /cannot be reused/
-  );
-  liveSession = { id: "session-3", lifecycle: "running", profile: { id: "research" }, job: null, uiRequests: new Map() };
-  const result = await PiService.prototype.task.call(service, {
-    session_id: "session-3",
-    message: "go",
-    profile: "research",
-    wait_seconds: 0
-  });
-  assert.equal(sent, 1);
-  assert.equal(result.run.status, "accepted");
+  assert.deepEqual(calls, ["send", "close"]);
 });

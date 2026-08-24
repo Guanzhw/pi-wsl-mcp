@@ -121,6 +121,11 @@ function answerMeta(result) {
   return result?.structuredContent?.answer_meta;
 }
 
+function expertAnswer(text, label) {
+  const prefix = "Pi " + label + " (untrusted):\n";
+  return typeof text === "string" && text.startsWith(prefix) ? text.slice(prefix.length) : null;
+}
+
 function request(method, params, timeoutMs = 30000) {
   const id = nextId++;
   const requestParams = useLegacyProtocol
@@ -182,8 +187,10 @@ try {
   }
   const taskTool = listed.result?.tools?.find((tool) => tool.name === "pi_task");
   const taskSchema = JSON.stringify(taskTool?.inputSchema || {});
-  assert.ok(taskSchema.includes('"session_id"'), "pi_task must accept a reusable live session_id.");
-  assert.ok(taskSchema.includes('"auto_close"'), "pi_task must accept auto_close.");
+  assert.ok(!taskSchema.includes('"session_id"'), "pi_task must be an ephemeral one-shot call.");
+  assert.ok(!taskSchema.includes('"auto_close"'), "pi_task closes its temporary session unconditionally.");
+  assert.ok(!taskSchema.includes('"wait_seconds"'), "pi_task must not expose async continuation controls.");
+  assert.ok(!taskSchema.includes('"include_details"'), "pi_task must not expose diagnostics in its high-level result.");
   assert.ok(taskSchema.includes('"max_elapsed_seconds"'), "pi_task must accept optional max_elapsed_seconds.");
   assert.ok(taskSchema.includes('"max_model_calls"'), "pi_task must accept optional max_model_calls.");
   assert.ok(taskSchema.includes('"max_cost"'), "pi_task must accept optional max_cost.");
@@ -194,8 +201,8 @@ try {
   const reviewSchema = JSON.stringify(
     (listed.result?.tools?.find((tool) => tool.name === "pi_review")?.inputSchema) || {}
   );
-  assert.ok(reviewSchema.includes('"session_id"'));
-  assert.ok(reviewSchema.includes('"auto_close"'));
+  assert.ok(!reviewSchema.includes('"session_id"'));
+  assert.ok(!reviewSchema.includes('"auto_close"'));
   assert.ok(reviewSchema.includes('"max_model_calls"'), "pi_review must accept optional budgets.");
 
   const info = await request("tools/call", {
@@ -222,63 +229,27 @@ try {
       arguments: {
         question: "Use the web_search tool exactly once to search for the official Model Context Protocol site. Return the title and direct URL of one result, and say that the search tool was used.",
         provider: "deepseek",
-        model: "deepseek-v4-flash",
-        wait_seconds: 120,
-        include_details: true,
-        auto_close: true
+        model: "deepseek-v4-flash"
       }
-    }, 150000);
+    }, 3600000);
     assert.equal(research.error, undefined);
-    const liveResult = research.result?.structuredContent?.result;
+    const liveResult = research.result?.structuredContent;
     if (process.argv.includes("--debug")) {
       process.stdout.write(JSON.stringify(liveResult, null, 2) + "\n");
     }
-    assert.equal(liveResult?.timed_out, false, "Pi research did not settle before the smoke timeout.");
-    assert.equal(liveResult?.run?.status, "settled");
-    const researchAnswer = answerFromContent(research.result?.content?.[0]?.text, "Pi research completed.");
+    assert.equal(liveResult?.status, "completed");
+    const researchAnswer = expertAnswer(research.result?.content?.[0]?.text, "research result");
     assert.notEqual(researchAnswer, null, "a settled research run must carry the final Pi text in content[0].text.");
     assert.ok(researchAnswer && researchAnswer.length > 0, "settled research must carry an answer.");
-    const researchMeta = answerMeta(research.result);
-    assert.equal(researchMeta?.has_answer, true);
-    assert.equal(researchMeta?.truncated, false);
-    assert.ok(researchMeta?.original_chars >= researchAnswer.length);
-    assert.equal(research.result?.structuredContent?.answer, undefined, "structuredContent must not duplicate the full answer.");
-    assert.equal(
-      liveResult?.run?.result?.assistant_text,
-      undefined,
-      "include_details diagnostics must never duplicate the answer in run.result."
-    );
+    assert.deepEqual(liveResult, { status: "completed", untrustedContent: true });
     // DeepSeek's native search runs server-side: the deepseek-responses
     // web-search extension injects {type:"web_search"} into the provider
     // request, so there is no local Pi tool_execution_start event for it.
     // Observable evidence is a settled, non-empty answer that cites a
     // search-result URL - and the absence of the 400 same-name conflict.
     assert.match(researchAnswer, /https?:\/\/\S+/, "the research answer must cite a search-result URL.");
-    assert.ok(
-      !(liveResult?.run?.recent_events || []).some((event) => event.type === "tool_execution_start" && event.tool_name === "search"),
-      "the research profile must never expose a function tool named search."
-    );
-    assert.equal(
-      liveResult?.session?.process_status,
-      "closed",
-      "auto_close must close the bridge process after settlement."
-    );
-    assert.equal(liveResult?.session?.lifecycle, "closed");
-    assert.equal(typeof liveResult?.session?.pi_session_id, "string", "auto_close must preserve the durable pi_session_id.");
-    assert.equal(liveResult?.run?.progress?.phase, "settled", "compact progress must report the settled phase.");
-    assert.equal(typeof liveResult?.run?.progress?.last_activity_at, "string");
-    assert.ok(liveResult?.run?.stats?.model_calls >= 1, "every real assistant message_end must be counted exactly once (retries legitimately add calls).");
-    assert.ok(liveResult?.run?.stats?.usage?.total > 0, "compact stats must carry token usage totals.");
-    assert.ok(liveResult?.run?.stats?.usage?.input > 0);
-    assert.equal(typeof liveResult?.run?.stats?.cost, "number");
-    assert.ok(Array.isArray(liveResult?.run?.stats?.models) && liveResult?.run?.stats?.models.length > 0);
-    assert.ok(liveResult?.run?.stats?.elapsed_ms > 0, "settled runs must report elapsed time.");
-
-    const close = await request("tools/call", {
-      name: "pi_close_session",
-      arguments: { session_id: liveResult.session.session_id }
-    });
-    assert.equal(close.error, undefined);
+    assert.equal(JSON.stringify(liveResult).includes("session_id"), false);
+    assert.equal(JSON.stringify(liveResult).includes("continuation"), false);
 
     if (process.argv.includes("--resume")) {
       const listedSessions = await request("tools/call", {
@@ -371,49 +342,27 @@ try {
       const workspaceTask = await request("tools/call", {
         name: "pi_task",
         arguments: {
-          profile: "workspace",
           provider: "deepseek",
           model: "deepseek-v4-flash",
-          wait_seconds: 120,
-          include_details: true,
           message: "Use the read tool to inspect package.json in the current workspace. Return only the package name. Do not modify files or run commands."
         }
-      }, 150000);
-      assert.equal(workspaceTask.error, undefined);
-      const workspaceResult = workspaceTask.result?.structuredContent?.result;
-      assert.equal(workspaceResult?.timed_out, false);
-      if (workspaceResult?.run?.status === "error") {
+      }, 3600000);
+      const workspaceResult = workspaceTask.result?.structuredContent;
+      if (workspaceTask.result?.isError) {
         // In environments where the user's workspace toolset contains a
         // function tool named `search` next to DeepSeek's native web_search
         // injection, the workspace profile keeps the normal toolset (never
         // silently rewritten) and must report the conflict as an accurate,
         // actionable run error - never a fake settled empty answer.
-        assert.match(workspaceResult?.run?.error || "", /conflicts with the provider's server-side web_search/);
-        assert.match(workspaceResult?.run?.error || "", /--exclude-tools search/);
-        assert.equal(workspaceResult?.run?.stop_reason, "error");
-        assert.equal(workspaceTask.result?.structuredContent?.answer_meta?.has_answer, false);
-        assert.match(workspaceTask.result?.content?.[0]?.text || "", /Pi task ended with an error/);
+        assert.equal(workspaceResult?.status, "failed");
+        assert.match(workspaceTask.result?.content?.[0]?.text || "", /conflicts with the provider's server-side web_search/);
       } else {
-        assert.equal(workspaceResult?.run?.status, "settled");
-        const workspaceAnswer = answerFromContent(workspaceTask.result?.content?.[0]?.text, "Pi completed a new task.");
+        assert.equal(workspaceTask.error, undefined);
+        assert.equal(workspaceResult?.status, "completed");
+        const workspaceAnswer = expertAnswer(workspaceTask.result?.content?.[0]?.text, "task result");
         assert.ok(workspaceAnswer && workspaceAnswer.length > 0, "settled workspace task must carry the answer in content[0].text.");
-        assert.equal(workspaceResult?.run?.result?.assistant_text, undefined);
-        assert.equal(workspaceTask.result?.structuredContent?.answer, undefined);
-        assert.equal(workspaceResult?.run?.progress?.phase, "settled");
-        assert.ok(workspaceResult?.run?.stats?.model_calls >= 1, "compact stats must count real assistant message_end events.");
-        assert.ok(workspaceResult?.run?.stats?.usage?.total > 0);
-        assert.ok(
-          (workspaceResult?.run?.recent_events || [])
-            .filter((event) => event.type === "tool_execution_start")
-            .some((event) => event.tool_name === "read"),
-          "The normal workspace session did not invoke Pi's read tool."
-        );
+        assert.equal(JSON.stringify(workspaceResult).includes("run_id"), false);
       }
-      const closeWorkspace = await request("tools/call", {
-        name: "pi_close_session",
-        arguments: { session_id: workspaceResult.session.session_id }
-      });
-      assert.equal(closeWorkspace.error, undefined);
     }
     if (useLifecycle) {
       const started = await request("tools/call", {
@@ -481,22 +430,21 @@ try {
       assert.equal(history.error, undefined);
       assert.ok((history.result?.structuredContent?.result?.entries || []).length > 0);
 
-      const reusedReview = await request("tools/call", {
-        name: "pi_review",
+      const continued = await request("tools/call", {
+        name: "pi_send",
         arguments: {
           session_id: liveSession.session_id,
-          request: "Re-check package.json using the read tool and return only its package name.",
-          wait_seconds: 120,
-          auto_close: true
+          message: "Re-check package.json using the read tool and return only its package name."
         }
+      });
+      assert.equal(continued.error, undefined);
+      const continuedRun = continued.result?.structuredContent?.result?.run_id;
+      const continuedResult = await request("tools/call", {
+        name: "pi_wait",
+        arguments: { session_id: liveSession.session_id, run_id: continuedRun, timeout_seconds: 120 }
       }, 150000);
-      assert.equal(reusedReview.error, undefined);
-      const reusedResult = reusedReview.result?.structuredContent?.result;
-      assert.equal(reusedResult?.timed_out, false);
-      assert.equal(reusedResult?.run?.status, "settled");
-      assert.equal(reusedResult?.session?.session_id, liveSession.session_id);
-      assert.equal(reusedResult?.session?.process_status, "closed");
-      assert.ok(reusedResult?.run?.stats?.usage?.total > 0);
+      assert.equal(continuedResult.error, undefined);
+      assert.equal(continuedResult.result?.structuredContent?.result?.run?.status, "settled");
 
       const closed = await request("tools/call", {
         name: "pi_close_session",
@@ -508,7 +456,7 @@ try {
       "MCP live Pi smoke passed (DeepSeek native web_search without the search-tool conflict"
         + (process.argv.includes("--resume") ? ", saved-session resume" : "")
         + (process.argv.includes("--workspace") ? ", workspace toolset (settled or actionable conflict error)" : "")
-        + (useLifecycle ? ", start/send/status/wait/history lifecycle, settled review reuse + auto-close" : "")
+        + (useLifecycle ? ", explicit start/send/status/wait/history lifecycle" : "")
         + ").\n"
     );
   } else {
