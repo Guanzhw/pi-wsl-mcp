@@ -31,6 +31,10 @@ const MODEL_STATUS = new Set(["idle", "running", "stopped", "failed"]);
 const CLEANUP_STATUS = new Set(["pending", "running", "completed", "failed"]);
 const MAX_MODEL_BUCKETS = 8;
 const OTHER_MODEL_BUCKET = "__other__";
+// High-level expert calls have a fixed synchronous window. When it expires,
+// the live session is deliberately retained so callers can continue with the
+// returned lifecycle tools instead of losing the in-flight Pi work.
+export const DEFAULT_SYNC_WINDOW_MS = 10 * 60 * 1000;
 // Saved-session identification stays bounded: a directory listing scans only
 // this prefix of each session file and never loads a whole transcript.
 const SESSION_PREVIEW_BYTES = 262144;
@@ -360,14 +364,6 @@ export function jobSnapshot(job, options = {}) {
     progress: runProgress(job),
     stats: runStats(job)
   };
-  if (job.budget) {
-    output.budget = {
-      max_elapsed_seconds: job.budget.maxElapsedSeconds,
-      max_model_calls: job.budget.maxModelCalls,
-      max_cost: job.budget.maxCost
-    };
-    output.budget_exceeded = job.budget.exceeded || null;
-  }
   if (includeDetails) {
     output.result = diagnosticRunResult(job.result);
     output.streamed_message_updates = job.messageUpdates;
@@ -527,14 +523,15 @@ async function readSessionPrefix(file) {
   }
 }
 
-// Directly reusable pi_wait/pi_status arguments for continuation after any
-// accepted operation or timeout. Always carries session_id; run_id is included
-// when a run exists. Both referenced tools are registered in every toolset
-// (core and full), so returned continuations are always usable by the client.
+// Directly reusable lifecycle arguments for continuation after any accepted
+// operation or background handoff. Always carries session_id; run_id is
+// included when a run exists. These controls are registered in every toolset,
+// so returned continuations are always usable by the client.
 function continuationFor(sessionId, runId) {
   return {
     pi_wait: runId ? { session_id: sessionId, run_id: runId } : { session_id: sessionId },
-    pi_status: { session_id: sessionId }
+    pi_status: { session_id: sessionId },
+    pi_kill_session: { session_id: sessionId }
   };
 }
 
@@ -559,104 +556,30 @@ function resolveCompletion(job) {
   job.completion.resolve(job);
 }
 
-// Backward-compatible optional run budgets on high-level tools. Each limit is
-// validated positive and bounded; budgets are never defaulted on. A nested
-// budget object with the same meanings is also accepted.
-function parseBudget(input) {
-  const source = input?.budget && typeof input.budget === "object" && !Array.isArray(input.budget)
-    ? {
-      max_elapsed_seconds: input.max_elapsed_seconds ?? input.budget.max_elapsed_seconds,
-      max_model_calls: input.max_model_calls ?? input.budget.max_model_calls,
-      max_cost: input.max_cost ?? input.budget.max_cost
-    }
-    : input || {};
-  const limits = [
-    ["max_elapsed_seconds", "maxElapsedSeconds", 86400, false],
-    ["max_model_calls", "maxModelCalls", 1000000, true],
-    ["max_cost", "maxCost", 10000, false]
-  ];
-  const budget = { maxElapsedSeconds: null, maxModelCalls: null, maxCost: null };
-  let present = false;
-  for (const [key, field, maximum, integerOnly] of limits) {
-    const value = source[key];
-    if (value === undefined || value === null) {
-      continue;
-    }
-    const number = typeof value === "number" ? value : Number(value);
-    if (!Number.isFinite(number) || number <= 0 || number > maximum || (integerOnly && !Number.isInteger(number))) {
-      throw new PiWslError(
-        "invalid_budget",
-        key + " must be a positive " + (integerOnly ? "integer" : "number") + " bounded by " + maximum + "."
-      );
-    }
-    budget[field] = number;
-    present = true;
-  }
-  return present ? budget : null;
-}
-
-// Which budget limit has fired for this run, if any. Fires at most once per
-// run: cancelRequested latches after the first exceeded limit.
-function budgetLimitFired(job) {
-  if (!job?.budget || job.budget.cancelRequested) {
-    return null;
-  }
-  if (job.budget.maxElapsedSeconds !== null && typeof job.startedAt === "string") {
-    const elapsedSeconds = (Date.now() - Date.parse(job.startedAt)) / 1000;
-    if (Number.isFinite(elapsedSeconds) && elapsedSeconds >= job.budget.maxElapsedSeconds) {
-      return "elapsed";
-    }
-  }
-  if (job.budget.maxModelCalls !== null && (job.stats?.modelCalls || 0) >= job.budget.maxModelCalls) {
-    return "model_calls";
-  }
-  if (job.budget.maxCost !== null && (job.stats?.cost || 0) >= job.budget.maxCost) {
-    return "cost";
-  }
-  return null;
-}
-
-function clearBudgetTimer(job) {
-  if (job?.budgetTimer) {
-    clearTimeout(job.budgetTimer);
-    job.budgetTimer = null;
-  }
-}
-
-function scheduleElapsedBudget(session, job) {
-  if (job?.budget?.maxElapsedSeconds === null || job?.budget?.maxElapsedSeconds === undefined) {
-    return;
-  }
-  const delayMs = Math.max(1, Math.ceil(job.budget.maxElapsedSeconds * 1000));
-  job.budgetTimer = setTimeout(() => {
-    job.budgetTimer = null;
-    if (session.job === job) {
-      checkRunBudget(session);
-    }
-  }, delayMs);
-  job.budgetTimer.unref?.();
-}
-
-// Convergence guard for optional run budgets. When a limit is exceeded while
-// the run is still active, request cancellation exactly once, report which
-// limit fired, and move the run to cancelling. Pi then settles it through the
-// normal agent_settled -> collection path; no further cancels are issued even
-// if the run keeps producing events before it settles.
-function checkRunBudget(session) {
-  const job = session?.job;
+// Wait on the run's event-driven settlement promise for a bounded window. The
+// window is an internal bridge policy, not a caller-supplied timeout. A false
+// result means the run is still active and must remain available for the
+// lifecycle tools.
+async function waitForCompletion(job, windowMs) {
   if (!job || !ACTIVE_JOB_STATES.has(job.status)) {
-    return;
+    return true;
   }
-  const limit = budgetLimitFired(job);
-  if (!limit) {
-    return;
+  if (!job.completion?.promise) {
+    return false;
   }
-  job.budget.exceeded = limit;
-  job.budget.cancelRequested = true;
-  job.status = "cancelling";
-  clearBudgetTimer(job);
-  job.events.push({ type: "budget_exceeded", limit, at: now() });
-  void (session.rpc?.command?.({ type: "abort" }) || Promise.resolve()).catch(() => {});
+  let timer;
+  try {
+    return await Promise.race([
+      job.completion.promise.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), windowMs);
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function activeProcessCount(sessions) {
@@ -679,29 +602,10 @@ export function actionableRunError(job) {
   return "Pi ended the run with stop_reason=error.";
 }
 
-// User-facing error for a run that ended because an optional budget limit
-// fired before a final answer was collected. The message names the limit and
-// how to retry; raw provider text is never included. The effective budget
-// fields stay in the structured snapshot (budget/budget_exceeded).
-export function budgetExhaustedError(job) {
-  const field = job?.budget?.exceeded === "model_calls"
-    ? "max_model_calls"
-    : job?.budget?.exceeded === "elapsed"
-      ? "max_elapsed_seconds"
-      : job?.budget?.exceeded === "cost"
-        ? "max_cost"
-        : null;
-  return field
-    ? "Pi's " + field + " budget was exhausted before a final answer was collected, so the run was cancelled without an answer. Retry without that budget limit, or with a higher " + field + "."
-    : "Pi's budget was exhausted before a final answer was collected, so the run was cancelled without an answer. Retry without the budget limit, or with a higher limit.";
-}
-
 // After agent_settled, a run is only a real success when the model did not
 // stop with an error AND a final assistant answer text was actually
 // collected. An empty answer, a stop_reason=error, or a failed collection all
 // make the run an error: agent_settled alone is never treated as success.
-// A run cancelled by an exhausted optional budget is reported with a
-// budget-specific error instead of the generic no-answer text.
 function settleRun(job) {
   if (job.stopReason === "error") {
     job.status = "error";
@@ -713,10 +617,6 @@ function settleRun(job) {
     : null;
   if (!answer) {
     job.status = "error";
-    if (job.budget?.exceeded) {
-      job.error = budgetExhaustedError(job);
-      return;
-    }
     job.error = "Pi settled the run without producing an answer text." + (job.stopReason ? " (stop_reason=" + job.stopReason + ")" : "");
     return;
   }
@@ -774,6 +674,7 @@ export class PiService {
       allowed_roots: this.allowedRoots,
       session_root: this.sessionRoot,
       max_live_sessions: this.config.maxSessions,
+      sync_window_seconds: DEFAULT_SYNC_WINDOW_MS / 1000,
       profiles: Object.values(PROFILES).map((profile) => ({
         id: profile.id,
         title: profile.title,
@@ -839,7 +740,6 @@ export class PiService {
     session.rpc.on("failure", (error) => {
       session.lifecycle = "faulted";
       if (session.job && ACTIVE_JOB_STATES.has(session.job.status)) {
-        clearBudgetTimer(session.job);
         session.job.status = "error";
         if (session.job.modelStatus === "running") {
           session.job.modelStatus = "failed";
@@ -857,7 +757,6 @@ export class PiService {
         session.lifecycle = "closed";
       }
       if (session.job && ACTIVE_JOB_STATES.has(session.job.status)) {
-        clearBudgetTimer(session.job);
         session.job.status = "error";
         if (session.job.modelStatus === "running") {
           session.job.modelStatus = "failed";
@@ -961,19 +860,17 @@ export class PiService {
       job.modelStatus = "stopped";
     }
     if (event?.type === "agent_settled" && job && ACTIVE_JOB_STATES.has(job.status)) {
-      clearBudgetTimer(job);
       job.status = "collecting";
       job.cleanupStatus = "running";
       job.settledAt = now();
       void this.collectFinalResult(session, job);
     }
-    checkRunBudget(session);
   }
 
   async collectFinalResult(session, job) {
     try {
       const response = await session.rpc.command({ type: "get_last_assistant_text" }, this.config.commandTimeoutMs);
-      if (session.job !== job) {
+      if (session.job !== job || session.lifecycle === "killed") {
         return;
       }
       job.result = {
@@ -982,7 +879,7 @@ export class PiService {
       job.cleanupStatus = "completed";
       settleRun(job);
     } catch (error) {
-      if (session.job !== job) {
+      if (session.job !== job || session.lifecycle === "killed") {
         return;
       }
       job.status = "error";
@@ -1102,25 +999,38 @@ export class PiService {
     bucket.cost += usage.cost;
   }
 
-  // Default high-level workflows are synchronous one-shot calls. They own an
-  // ephemeral Pi process, await the run's settlement event, return only the
-  // final answer/error contract, and release the process before returning.
+  // Default high-level workflows wait on Pi's settlement event for a fixed
+  // ten-minute synchronous window. A longer run is handed back as a live
+  // session instead of being cancelled or silently discarded.
   async runOnce(input) {
     const started = await this.startSession(input);
     const session = this.getSession(started.session_id);
+    let keepSession = false;
     try {
       await this.send({
         session_id: session.id,
         message: input.message,
-        behavior: "prompt",
-        max_elapsed_seconds: input.max_elapsed_seconds,
-        max_model_calls: input.max_model_calls,
-        max_cost: input.max_cost,
-        budget: input.budget
+        behavior: "prompt"
       });
       const job = session.job;
-      if (job && ACTIVE_JOB_STATES.has(job.status)) {
-        await job.completion.promise;
+      const syncWindowMs = Number.isFinite(this.config?.syncWindowMs) && this.config.syncWindowMs >= 0
+        ? this.config.syncWindowMs
+        : DEFAULT_SYNC_WINDOW_MS;
+      const settled = await waitForCompletion(job, syncWindowMs);
+      if (!settled && job && ACTIVE_JOB_STATES.has(job.status)) {
+        keepSession = true;
+        return {
+          status: "background",
+          answer: null,
+          error: null,
+          session_id: session.id,
+          run_id: job.id,
+          session: typeof this.liveSummary === "function"
+            ? this.liveSummary(session, false)
+            : { session_id: session.id, lifecycle: session.lifecycle },
+          run: jobSnapshot(job),
+          continuation: continuationFor(session.id, job.id)
+        };
       }
       return {
         status: job?.status === "settled" ? "completed" : "failed",
@@ -1128,11 +1038,13 @@ export class PiService {
         error: job?.status === "error" ? job.error || "Pi run failed." : null
       };
     } finally {
-      try {
-        await this.close({ session_id: session.id });
-      } catch {
-        // A process that failed or exited while producing the terminal result
-        // may already be closed.
+      if (!keepSession) {
+        try {
+          await this.close({ session_id: session.id });
+        } catch {
+          // A process that failed or exited while producing the terminal result
+          // may already be closed.
+        }
       }
     }
   }
@@ -1157,7 +1069,6 @@ export class PiService {
         kind: "prompt",
         modelStatus: "idle",
         cleanupStatus: "pending",
-        budget: parseBudget(input),
         startedAt: now(),
         settledAt: null,
         events: [],
@@ -1176,13 +1087,11 @@ export class PiService {
         }
       };
       session.job = job;
-      scheduleElapsedBudget(session, job);
       try {
         await session.rpc.command({ type: "prompt", message: input.message });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (session.job === job) {
-          clearBudgetTimer(job);
           job.status = "error";
           job.cleanupStatus = "failed";
           job.error = message;
@@ -1237,25 +1146,10 @@ export class PiService {
     if (!job || (input.run_id && input.run_id !== job.id)) {
       throw new PiWslError("unknown_run", "No matching current run exists for this Pi session.");
     }
-    const maxWaitSeconds = this.config?.maxWaitSeconds ?? 285;
-    const requestedSeconds = input.timeout_seconds ?? 120;
-    const effectiveSeconds = Math.max(0, Math.min(requestedSeconds, maxWaitSeconds));
-    const clamped = requestedSeconds > effectiveSeconds;
-    if (ACTIVE_JOB_STATES.has(job.status) && effectiveSeconds > 0) {
-      let timeout;
-      try {
-        await Promise.race([
-          job.completion?.promise || Promise.resolve(),
-          new Promise((resolve) => {
-            timeout = setTimeout(resolve, effectiveSeconds * 1000);
-          })
-        ]);
-      } finally {
-        if (timeout) {
-          clearTimeout(timeout);
-        }
-      }
-    }
+    const waitWindowMs = Number.isFinite(this.config?.waitWindowMs) && this.config.waitWindowMs >= 0
+      ? this.config.waitWindowMs
+      : DEFAULT_SYNC_WINDOW_MS;
+    await waitForCompletion(job, waitWindowMs);
     const result = {
       timed_out: ACTIVE_JOB_STATES.has(job.status),
       session_id: session.id,
@@ -1265,14 +1159,6 @@ export class PiService {
       run: jobSnapshot(job, { includeDetails: input.include_details }),
       continuation: continuationFor(session.id, job.id)
     };
-    if (clamped) {
-      result.wait = {
-        requested_seconds: requestedSeconds,
-        effective_seconds: effectiveSeconds,
-        clamped: true,
-        max_seconds: maxWaitSeconds
-      };
-    }
     return result;
   }
 
@@ -1300,13 +1186,43 @@ export class PiService {
       throw new PiWslError("no_active_run", "No active Pi run can be cancelled.");
     }
     await session.rpc.command({ type: "abort" });
-    clearBudgetTimer(job);
     job.status = "cancelling";
     job.events.push({ type: "abort_acknowledged", at: now() });
     return {
       session_id: session.id,
       ...jobSnapshot(job),
       continuation: continuationFor(session.id, job.id)
+    };
+  }
+
+  async killSession(input) {
+    const session = this.getSession(input.session_id);
+    const job = session.job;
+    if (session.lifecycle === "closed" || session.lifecycle === "killed") {
+      throw new PiWslError("pi_not_running", "This Pi session is " + session.lifecycle + ".");
+    }
+    // Latch the terminal state before killing the child so the exit event does
+    // not overwrite the deliberate force-kill reason with a generic process
+    // exit error.
+    session.lifecycle = "killed";
+    session.uiRequests?.clear();
+    if (job && ACTIVE_JOB_STATES.has(job.status)) {
+      job.uiRequests?.clear();
+      job.status = "error";
+      job.modelStatus = job.modelStatus === "running" ? "failed" : job.modelStatus;
+      job.cleanupStatus = job.cleanupStatus === "completed" ? "completed" : "failed";
+      job.error = "Pi session was force-killed.";
+      job.settledAt = now();
+      job.events.push({ type: "session_killed", at: job.settledAt });
+      resolveCompletion(job);
+    }
+    await session.rpc.kill();
+    return {
+      session_id: session.id,
+      killed: true,
+      run_id: job?.id || null,
+      pi_session_id: session.state?.sessionId || null,
+      pi_session_file: session.state?.sessionFile || null
     };
   }
 

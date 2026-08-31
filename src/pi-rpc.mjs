@@ -251,12 +251,16 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   fail(error) {
+    this.rejectPending(error);
+    this.emit("failure", error);
+  }
+
+  rejectPending(error) {
     for (const [id, pending] of this.pending) {
       this.pending.delete(id);
       clearTimeout(pending.timer);
       pending.reject(error);
     }
-    this.emit("failure", error);
   }
 
   async close() {
@@ -274,6 +278,31 @@ export class PiRpcProcess extends EventEmitter {
     ]);
     if (child.exitCode === null) {
       child.kill("SIGKILL");
+    }
+  }
+
+  // Force termination is intentionally separate from close(): callers use it
+  // when a live agent must stop immediately, while close() still gives Pi a
+  // short graceful shutdown window. Pending RPCs are rejected locally and no
+  // process-failure event is emitted because the caller explicitly requested
+  // this outcome.
+  async kill() {
+    if (!this.child || this.closed) {
+      return;
+    }
+    this.closed = true;
+    const child = this.child;
+    this.rejectPending(new PiWslError("pi_session_killed", "Pi session was force-killed."));
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+    }
+    await Promise.race([
+      exited,
+      new Promise((resolve) => setTimeout(resolve, 2500))
+    ]);
+    if (child.exitCode === null) {
+      child.kill();
     }
   }
 }

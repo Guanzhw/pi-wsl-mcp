@@ -3,7 +3,7 @@ import test from "node:test";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { PROFILES, PiService, actionableRunError, jobSnapshot, liveDirectoryEntry, savedDirectoryEntry, runProgress, runStats, usageFromMessage } from "../src/pi-service.mjs";
+import { DEFAULT_SYNC_WINDOW_MS, PROFILES, PiService, actionableRunError, jobSnapshot, liveDirectoryEntry, savedDirectoryEntry, runProgress, runStats, usageFromMessage } from "../src/pi-service.mjs";
 
 function activeJob(overrides = {}) {
   return {
@@ -12,7 +12,6 @@ function activeJob(overrides = {}) {
     kind: "prompt",
     modelStatus: "idle",
     cleanupStatus: "pending",
-    budget: null,
     startedAt: "2026-08-01T00:00:00.000Z",
     settledAt: null,
     events: [],
@@ -42,7 +41,6 @@ function settledJob() {
     status: "settled",
     modelStatus: "stopped",
     cleanupStatus: "completed",
-    budget: null,
     startedAt: "2026-08-01T00:00:00.000Z",
     settledAt: "2026-08-01T00:01:00.000Z",
     kind: "prompt",
@@ -65,7 +63,6 @@ test("job snapshots are compact by default and detailed only on request", () => 
   assert.equal(compact.status, "settled");
   assert.equal(compact.model_status, "stopped");
   assert.equal(compact.cleanup_status, "completed");
-  assert.equal(compact.budget, undefined, "runs without budgets carry no budget fields");
   assert.equal(compact.progress.phase, "settled");
   assert.equal(compact.stats.model_calls, 0);
 
@@ -75,6 +72,16 @@ test("job snapshots are compact by default and detailed only on request", () => 
   assert.equal(detailed.recent_events.length, 1);
   assert.equal(detailed.streamed_message_updates, 42);
   assert.equal(detailed.tool_calls, undefined);
+});
+
+test("diagnostics report the fixed ten-minute synchronous window", () => {
+  const result = PiService.prototype.diagnostics.call({
+    config: { piBin: "/home/user/.npm-global/bin/pi", maxSessions: 3 },
+    allowedRoots: ["/home/user/work"],
+    defaultWorkspace: "/home/user/work",
+    sessionRoot: "/home/user/.pi/agent/sessions"
+  });
+  assert.equal(result.sync_window_seconds, 600);
 });
 
 test("wait lifts the answer while keeping its run snapshot compact by default", async () => {
@@ -87,8 +94,7 @@ test("wait lifts the answer while keeping its run snapshot compact by default", 
 
   const compact = await PiService.prototype.wait.call(service, {
     session_id: "session-1",
-    run_id: "run-1",
-    timeout_seconds: 0
+    run_id: "run-1"
   });
   assert.equal(compact.answer, "Compact answer.");
   assert.equal(compact.run.result, undefined);
@@ -97,14 +103,13 @@ test("wait lifts the answer while keeping its run snapshot compact by default", 
   assert.equal(compact.run_id, "run-1");
   assert.deepEqual(compact.continuation, {
     pi_wait: { session_id: "session-1", run_id: "run-1" },
-    pi_status: { session_id: "session-1" }
+    pi_status: { session_id: "session-1" },
+    pi_kill_session: { session_id: "session-1" }
   });
-  assert.equal(compact.wait, undefined, "an unclamped wait carries no wait metadata");
 
   const detailed = await PiService.prototype.wait.call(service, {
     session_id: "session-1",
     run_id: "run-1",
-    timeout_seconds: 0,
     include_details: true
   });
   assert.equal(detailed.answer, "Compact answer.");
@@ -113,7 +118,7 @@ test("wait lifts the answer while keeping its run snapshot compact by default", 
   assert.equal(detailed.run.recent_events.length, 1);
 });
 
-test("wait clamps a requested 300s timeout to the configured margin with transparent metadata", async () => {
+test("wait uses the fixed bridge window without a caller timeout", async () => {
   const settleSoon = (job, ms = 30) => {
     setTimeout(() => {
       job.status = "settled";
@@ -122,7 +127,7 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
     }, ms);
   };
   const service = {
-    config: { maxWaitSeconds: 285 },
+    config: { waitWindowMs: 100 },
     liveSummary: () => ({ session_id: "session-1", process_status: "running" })
   };
   let currentSession = null;
@@ -136,7 +141,6 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
   const result = await PiService.prototype.wait.call(service, {
     session_id: "session-1",
     run_id: "run-1",
-    timeout_seconds: 300
   });
   assert.equal(result.session_id, "session-1");
   assert.equal(result.run_id, "run-1");
@@ -144,38 +148,9 @@ test("wait clamps a requested 300s timeout to the configured margin with transpa
   assert.equal(result.session.process_status, "running");
   assert.deepEqual(result.continuation, {
     pi_wait: { session_id: "session-1", run_id: "run-1" },
-    pi_status: { session_id: "session-1" }
+    pi_status: { session_id: "session-1" },
+    pi_kill_session: { session_id: "session-1" }
   });
-  assert.deepEqual(result.wait, {
-    requested_seconds: 300,
-    effective_seconds: 285,
-    clamped: true,
-    max_seconds: 285
-  });
-
-  const customJob = activeJob();
-  customJob.completion = {};
-  customJob.completion.promise = new Promise((resolve) => { customJob.completion.resolve = resolve; });
-  settleSoon(customJob);
-  currentSession = { id: "session-1", job: customJob };
-  const custom = await PiService.prototype.wait.call(service, {
-    session_id: "session-1",
-    run_id: "run-1",
-    timeout_seconds: 290
-  });
-  assert.equal(custom.wait.effective_seconds, 285, "the configured margin is the cap");
-
-  const freeJob = activeJob();
-  freeJob.completion = {};
-  freeJob.completion.promise = new Promise((resolve) => { freeJob.completion.resolve = resolve; });
-  settleSoon(freeJob);
-  currentSession = { id: "session-1", job: freeJob };
-  const free = await PiService.prototype.wait.call(service, {
-    session_id: "session-1",
-    run_id: "run-1",
-    timeout_seconds: 100
-  });
-  assert.equal(free.wait, undefined, "waits under the cap are never flagged as clamped");
 });
 test("status defaults to a compact live/job snapshot and opts into bounded diagnostics", async () => {
   const session = {
@@ -206,7 +181,8 @@ test("status defaults to a compact live/job snapshot and opts into bounded diagn
   assert.equal(compact.job.tool_calls, undefined);
   assert.deepEqual(compact.continuation, {
     pi_wait: { session_id: "session-1", run_id: "run-1" },
-    pi_status: { session_id: "session-1" }
+    pi_status: { session_id: "session-1" },
+    pi_kill_session: { session_id: "session-1" }
   });
 
   const detailed = await PiService.prototype.status.call(service, {
@@ -223,15 +199,14 @@ test("an expiring wait for a still-active run returns a structured timeout, neve
   const job = activeJob();
   const session = { id: "session-1", job };
   const service = {
-    config: { maxWaitSeconds: 1 },
+    config: { waitWindowMs: 5 },
     getSession: () => session,
     liveSummary: () => ({ session_id: "session-1", process_status: "running" })
   };
   const started = Date.now();
   const result = await PiService.prototype.wait.call(service, {
     session_id: "session-1",
-    run_id: "run-1",
-    timeout_seconds: 1
+    run_id: "run-1"
   });
   assert.ok(Date.now() - started < 5000, "the wait must actually expire quickly");
   assert.equal(result.timed_out, true);
@@ -243,7 +218,8 @@ test("an expiring wait for a still-active run returns a structured timeout, neve
   assert.equal(result.session.process_status, "running");
   assert.deepEqual(result.continuation, {
     pi_wait: { session_id: "session-1", run_id: "run-1" },
-    pi_status: { session_id: "session-1" }
+    pi_status: { session_id: "session-1" },
+    pi_kill_session: { session_id: "session-1" }
   });
 });
 
@@ -341,108 +317,7 @@ test("late non-interactive status notifications never reopen or block a run", as
   assert.equal(job.modelStatus, "stopped");
 });
 
-test("elapsed budget fires once and requests a single cancel", async () => {
-  const job = activeJob({
-    status: "running",
-    modelStatus: "running",
-    startedAt: new Date(Date.now() - 60000).toISOString(),
-    budget: { maxElapsedSeconds: 30, maxModelCalls: null, maxCost: null, exceeded: null, cancelRequested: false }
-  });
-  const aborts = [];
-  const session = {
-    id: "session-1",
-    job,
-    uiRequests: new Map(),
-    rpc: { command: async (command) => { aborts.push(command); return { success: true }; } }
-  };
-  const service = Object.create(PiService.prototype);
-  service.config = { commandTimeoutMs: 1000 };
-
-  service.handleEvent(session, { type: "tool_execution_start", toolCallId: "t1", toolName: "read" });
-  service.handleEvent(session, { type: "tool_execution_start", toolCallId: "t2", toolName: "grep" });
-  assert.equal(aborts.length, 1, "the exceeded budget must cancel exactly once");
-  assert.equal(job.budget.exceeded, "elapsed");
-  assert.equal(job.budget.cancelRequested, true);
-  assert.equal(job.status, "cancelling");
-  assert.ok(job.events.some((event) => event.type === "budget_exceeded" && event.limit === "elapsed"));
-  service.handleEvent(session, { type: "message_end", message: { role: "assistant", usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0.001 } } } });
-  assert.equal(aborts.length, 1, "later events must not re-request cancellation");
-});
-
-test("elapsed budget fires without an event stream or active waiter", async () => {
-  const commands = [];
-  const session = {
-    id: "session-silent",
-    lifecycle: "running",
-    job: null,
-    uiRequests: new Map(),
-    rpc: {
-      command: async (command) => {
-        commands.push(command);
-        return { success: true };
-      }
-    }
-  };
-  const service = {
-    getSession: () => session,
-    liveSummary: () => ({ session_id: session.id, process_status: session.lifecycle })
-  };
-
-  await PiService.prototype.send.call(service, {
-    session_id: session.id,
-    message: "work silently",
-    behavior: "prompt",
-    max_elapsed_seconds: 0.02
-  });
-  await new Promise((resolve) => setTimeout(resolve, 60));
-
-  assert.equal(commands.filter((command) => command.type === "prompt").length, 1);
-  assert.equal(commands.filter((command) => command.type === "abort").length, 1);
-  assert.equal(session.job.status, "cancelling");
-  assert.equal(session.job.budget.exceeded, "elapsed");
-});
-
-test("model-call budget fires once and cost budget fires once", async () => {
-  const makeService = (job) => {
-    const aborts = [];
-    const session = {
-      id: "session-1",
-      job,
-      uiRequests: new Map(),
-      rpc: { command: async (command) => { aborts.push(command); return { success: true }; } }
-    };
-    const service = Object.create(PiService.prototype);
-    service.config = { commandTimeoutMs: 1000 };
-    return { service, session, aborts };
-  };
-  const usage = { role: "assistant", provider: "deepseek", model: "m", usage: { input: 2, output: 2, totalTokens: 4, cost: { total: 0.01 } } };
-
-  const calls = makeService(activeJob({
-    status: "running",
-    modelStatus: "running",
-    budget: { maxElapsedSeconds: null, maxModelCalls: 2, maxCost: null, exceeded: null, cancelRequested: false }
-  }));
-  calls.service.handleEvent(calls.session, { type: "message_end", message: usage });
-  calls.service.handleEvent(calls.session, { type: "message_end", message: usage });
-  assert.equal(calls.aborts.length, 1);
-  assert.equal(calls.session.job.budget.exceeded, "model_calls");
-  calls.service.handleEvent(calls.session, { type: "message_end", message: usage });
-  assert.equal(calls.aborts.length, 1, "model_calls limit must not re-cancel");
-
-  const cost = makeService(activeJob({
-    status: "running",
-    modelStatus: "running",
-    budget: { maxElapsedSeconds: null, maxModelCalls: null, maxCost: 0.015, exceeded: null, cancelRequested: false }
-  }));
-  cost.service.handleEvent(cost.session, { type: "message_end", message: usage });
-  assert.equal(cost.aborts.length, 0, "cost is below the limit after one message");
-  cost.service.handleEvent(cost.session, { type: "message_end", message: usage });
-  assert.equal(cost.aborts.length, 1);
-  assert.equal(cost.session.job.budget.exceeded, "cost");
-  assert.equal(cost.session.job.status, "cancelling");
-});
-
-test("budget-less runs are unchanged and never cancel", async () => {
+test("runs never carry caller budgets and remain active until Pi settles", async () => {
   const job = activeJob({ status: "running", modelStatus: "running" });
   const aborts = [];
   const session = {
@@ -458,16 +333,6 @@ test("budget-less runs are unchanged and never cancel", async () => {
   const snapshot = jobSnapshot(job);
   assert.equal(snapshot.budget, undefined);
   assert.equal(snapshot.budget_exceeded, undefined);
-});
-
-test("job snapshots expose optional budgets and the fired limit", async () => {
-  const job = activeJob({
-    status: "cancelling",
-    budget: { maxElapsedSeconds: 60, maxModelCalls: 5, maxCost: null, exceeded: "model_calls", cancelRequested: true }
-  });
-  const snapshot = jobSnapshot(job);
-  assert.deepEqual(snapshot.budget, { max_elapsed_seconds: 60, max_model_calls: 5, max_cost: null });
-  assert.equal(snapshot.budget_exceeded, "model_calls");
 });
 
 test("live directory entries are minimal and expose active_run only when a job exists", () => {
@@ -1099,12 +964,8 @@ test("agent_settled without a collectable answer is an error, never an empty set
   assert.equal(jobSnapshot(job).stop_reason, null);
 });
 
-test("a budget-exhausted run without a final answer gets an explicit budget error", async () => {
-  const job = activeJob({
-    status: "running",
-    modelStatus: "running",
-    budget: { maxElapsedSeconds: null, maxModelCalls: 5, maxCost: null, exceeded: "model_calls", cancelRequested: true }
-  });
+test("a run without a final answer gets the generic observed error", async () => {
+  const job = activeJob({ status: "running", modelStatus: "running" });
   const session = {
     id: "session-1",
     job,
@@ -1120,13 +981,11 @@ test("a budget-exhausted run without a final answer gets an explicit budget erro
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(job.status, "error", "a cancelled run without an answer must never settle as success");
-  assert.match(job.error, /max_model_calls budget was exhausted before a final answer was collected/);
-  assert.match(job.error, /Retry without that budget limit, or with a higher max_model_calls\./);
+  assert.match(job.error, /without producing an answer text/);
   assert.ok(!job.error.includes("api_key") && !job.error.includes("boom"), "no raw provider text may leak");
-  // The structured snapshot still exposes the effective budget fields.
   const snapshot = jobSnapshot(job);
-  assert.equal(snapshot.budget_exceeded, "model_calls");
-  assert.deepEqual(snapshot.budget, { max_elapsed_seconds: null, max_model_calls: 5, max_cost: null });
+  assert.equal(snapshot.budget, undefined);
+  assert.equal(snapshot.budget_exceeded, undefined);
   assert.equal(snapshot.status, "error");
 });
 
@@ -1186,7 +1045,8 @@ test("a rejected prompt preserves accepted session and run ids on the error", as
       assert.equal(error.details?.accepted_result?.run_id, session.job.id);
       assert.deepEqual(error.details?.accepted_result?.continuation, {
         pi_wait: { session_id: session.id, run_id: session.job.id },
-        pi_status: { session_id: session.id }
+        pi_status: { session_id: session.id },
+        pi_kill_session: { session_id: session.id }
       });
       assert.equal(error.details?.accepted_result?.run?.status, "error");
       return true;
@@ -1195,6 +1055,7 @@ test("a rejected prompt preserves accepted session and run ids on the error", as
 });
 
 test("runOnce waits for settlement without polling and closes the ephemeral session", async () => {
+  assert.equal(DEFAULT_SYNC_WINDOW_MS, 10 * 60 * 1000);
   let resolveCompletion;
   const job = activeJob();
   job.completion = {
@@ -1224,4 +1085,73 @@ test("runOnce waits for settlement without polling and closes the ephemeral sess
     error: null
   });
   assert.deepEqual(calls, ["send", "close"]);
+});
+
+test("runOnce hands an active job to the background after the fixed window", async () => {
+  let resolveCompletion;
+  const job = activeJob();
+  job.completion = {
+    promise: new Promise((resolve) => { resolveCompletion = resolve; })
+  };
+  const session = { id: "session-background", lifecycle: "running", job };
+  const calls = [];
+  const service = {
+    config: { syncWindowMs: 5 },
+    startSession: async () => ({ session_id: session.id }),
+    getSession: () => session,
+    send: async () => { calls.push("send"); return { run_id: job.id }; },
+    close: async () => { calls.push("close"); }
+  };
+
+  const result = await PiService.prototype.runOnce.call(service, { message: "long review" });
+  assert.equal(result.status, "background");
+  assert.equal(result.answer, null);
+  assert.equal(result.session_id, session.id);
+  assert.equal(result.run_id, job.id);
+  assert.equal(result.run.status, "running");
+  assert.deepEqual(result.continuation, {
+    pi_wait: { session_id: session.id, run_id: job.id },
+    pi_status: { session_id: session.id },
+    pi_kill_session: { session_id: session.id }
+  });
+  assert.deepEqual(calls, ["send"], "a background handoff must keep the Pi process alive");
+
+  // Finish the mock run so its completion promise does not remain pending in
+  // the test process; the real session remains available to pi_wait.
+  job.status = "settled";
+  resolveCompletion(job);
+});
+
+test("killSession force-exits the process and settles an active run as failed", async () => {
+  let resolveCompletion;
+  const job = activeJob({ status: "running", modelStatus: "running" });
+  job.completion = {
+    settled: false,
+    promise: new Promise((resolve) => { resolveCompletion = resolve; }),
+    resolve: (value) => resolveCompletion(value)
+  };
+  const session = {
+    id: "session-kill",
+    lifecycle: "running",
+    state: { sessionId: "pi-kill", sessionFile: "/home/user/.pi/agent/sessions/pi-kill.jsonl" },
+    job,
+    rpc: { kill: async () => { session.killed = true; } }
+  };
+  const service = { getSession: () => session };
+
+  const result = await PiService.prototype.killSession.call(service, { session_id: session.id });
+  assert.equal(session.killed, true);
+  assert.equal(session.lifecycle, "killed");
+  assert.equal(job.status, "error");
+  assert.equal(job.modelStatus, "failed");
+  assert.equal(job.error, "Pi session was force-killed.");
+  assert.deepEqual(result, {
+    session_id: session.id,
+    killed: true,
+    run_id: job.id,
+    pi_session_id: "pi-kill",
+    pi_session_file: "/home/user/.pi/agent/sessions/pi-kill.jsonl"
+  });
+  assert.equal(job.completion.settled, true);
+  resolveCompletion?.(job);
 });

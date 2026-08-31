@@ -72,7 +72,6 @@ test("config defaults derive from the actual WSL home and working directory", ()
   assert.deepEqual(config.allowedRootInputs, [process.cwd()]);
   assert.equal(config.sessionRootInput, "/home/alice/.pi/agent/sessions");
   assert.equal(config.maxSessions, 3);
-  assert.equal(config.maxWaitSeconds, 285);
   assert.equal(config.startupTimeoutMs, 45000);
   assert.equal(config.commandTimeoutMs, 30000);
   assert.equal(config.maxSavedSessions, 100);
@@ -121,27 +120,23 @@ test("PI_WSL_MCP_* overrides win and PI_LOCAL_MCP_* remains a deprecated alias",
     PI_WSL_MCP_DEFAULT_CWD: "/home/alice/work",
     PI_WSL_MCP_ALLOWED_ROOTS: "/home/alice/work;/srv/src",
     PI_WSL_MCP_SESSION_ROOT: "/srv/sessions",
-    PI_WSL_MCP_MAX_WAIT_SECONDS: "120",
     PI_WSL_MCP_MAX_SESSIONS: "5"
   });
   assert.equal(viaCurrent.piBin, "/opt/pi/bin/pi");
   assert.equal(viaCurrent.defaultWorkspace, "/home/alice/work");
   assert.deepEqual(viaCurrent.allowedRootInputs, ["/home/alice/work", "/srv/src"]);
   assert.equal(viaCurrent.sessionRootInput, "/srv/sessions");
-  assert.equal(viaCurrent.maxWaitSeconds, 120);
   assert.equal(viaCurrent.maxSessions, 5);
 
   const viaLegacy = createConfig({
     HOME: "/home/alice",
     PI_LOCAL_MCP_PI_BIN: "/opt/pi/bin/pi",
     PI_LOCAL_MCP_DEFAULT_CWD: "/home/alice/work",
-    PI_LOCAL_MCP_ALLOWED_ROOTS: "/home/alice/work;/srv/src",
-    PI_LOCAL_MCP_MAX_WAIT_SECONDS: "120"
+    PI_LOCAL_MCP_ALLOWED_ROOTS: "/home/alice/work;/srv/src"
   });
   assert.equal(viaLegacy.piBin, "/opt/pi/bin/pi");
   assert.equal(viaLegacy.defaultWorkspace, "/home/alice/work");
   assert.deepEqual(viaLegacy.allowedRootInputs, ["/home/alice/work", "/srv/src"]);
-  assert.equal(viaLegacy.maxWaitSeconds, 120);
 
   const precedence = createConfig({
     HOME: "/home/alice",

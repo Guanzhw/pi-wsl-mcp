@@ -6,7 +6,7 @@ import { PiWslError } from "../src/util.mjs";
 
 async function withClient(service, run, options = {}) {
   // The helper pins the full toolset by default because the existing tests
-  // exercise the complete 20-tool surface. Tests proving the server's own
+  // exercise the complete 21-tool surface. Tests proving the server's own
   // default-core behavior pass injectToolset: false; an explicit toolset
   // option selects that surface directly.
   const configured = options.injectToolset === false
@@ -24,13 +24,13 @@ async function withClient(service, run, options = {}) {
   }
 }
 
-// The daily-agent workflow surface of the default core toolset and the
-// diagnostics/advanced controls that only the full toolset registers.
+// The daily-agent workflow surface of the default core toolset, plus the
+// continuation controls shared with full; remaining diagnostics stay full-only.
 const CORE_TOOLSET_TOOLS = [
-  "pi_task", "pi_research", "pi_review"
+  "pi_task", "pi_research", "pi_review", "pi_wait", "pi_status", "pi_kill_session"
 ];
 const FULL_ONLY_TOOLS = [
-  "pi_info", "pi_start_session", "pi_send", "pi_wait", "pi_status", "pi_cancel",
+  "pi_info", "pi_start_session", "pi_send", "pi_cancel",
   "pi_respond_ui", "pi_history", "pi_sessions", "pi_resume_session", "pi_models",
   "pi_set_model", "pi_set_thinking", "pi_compact", "pi_fork", "pi_commands", "pi_close_session"
 ];
@@ -56,7 +56,7 @@ test("high-level Pi workflows expose a direct, answer-first untrusted result", a
 
   await withClient(service, async (client) => {
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 20);
+    assert.equal(tools.tools.length, 21);
     assert.ok(tools.tools.some((tool) => tool.name === "pi_send"));
     assert.ok(!tools.tools.some((tool) => tool.name === "pi_steer"));
 
@@ -89,7 +89,7 @@ test("high-level workflows reject legacy async controls", async () => {
   });
 });
 
-test("pi_wait accepts a 300s timeout without schema rejection and exposes the clamp metadata", async () => {
+test("pi_wait removes the public timeout parameter and keeps continuation controls", async () => {
   const inputs = [];
   const service = {
     wait: async (input) => {
@@ -102,23 +102,28 @@ test("pi_wait accepts a 300s timeout without schema rejection and exposes the cl
         run: { run_id: "run-1", status: "running", model_status: "running", cleanup_status: "pending" },
         continuation: {
           pi_wait: { session_id: "session-1", run_id: "run-1" },
-          pi_status: { session_id: "session-1" }
-        },
-        wait: { requested_seconds: 300, effective_seconds: 285, clamped: true, max_seconds: 285 }
+          pi_status: { session_id: "session-1" },
+          pi_kill_session: { session_id: "session-1" }
+        }
       };
     }
   };
   await withClient(service, async (client) => {
-    const result = await client.callTool({
+    const rejected = await client.callTool({
       name: "pi_wait",
       arguments: { session_id: "session-1", run_id: "run-1", timeout_seconds: 300 }
     });
-    assert.equal(result.isError, undefined, "300s must stay schema-compatible, not rejected");
-    assert.equal(inputs[0].timeout_seconds, 300, "the service receives the requested 300s and clamps internally");
+    assert.equal(rejected.isError, true, "timeout_seconds must no longer be accepted");
+    assert.equal(inputs.length, 0);
+    const result = await client.callTool({
+      name: "pi_wait",
+      arguments: { session_id: "session-1", run_id: "run-1" }
+    });
+    assert.equal(inputs[0].timeout_seconds, undefined);
     const payload = result.structuredContent?.result;
     assert.equal(payload.session_id, "session-1");
     assert.equal(payload.run_id, "run-1");
-    assert.deepEqual(payload.wait, { requested_seconds: 300, effective_seconds: 285, clamped: true, max_seconds: 285 });
+    assert.equal(payload.wait, undefined);
     assert.equal(payload.run.model_status, "running");
     assert.equal(payload.run.cleanup_status, "pending");
     assert.equal(payload.session.process_status, "running");
@@ -126,7 +131,7 @@ test("pi_wait accepts a 300s timeout without schema rejection and exposes the cl
   });
 });
 
-test("budget options are accepted on the high-level tools and validated positive and bounded", async () => {
+test("budget fields are rejected by every high-level workflow", async () => {
   const inputs = [];
   const service = {
     runOnce: async (input) => {
@@ -135,64 +140,20 @@ test("budget options are accepted on the high-level tools and validated positive
     }
   };
   await withClient(service, async (client) => {
-    const task = await client.callTool({
-      name: "pi_task",
-      arguments: {
-        message: "go",
-        max_elapsed_seconds: 120,
-        max_model_calls: 5,
-        max_cost: 0.5
-      }
-    });
-    assert.equal(task.error, undefined);
-    assert.equal(inputs[0].max_elapsed_seconds, 120);
-    assert.equal(inputs[0].max_model_calls, 5);
-    assert.equal(inputs[0].max_cost, 0.5);
-
-    const research = await client.callTool({
-      name: "pi_research",
-      arguments: {
-        question: "q",
-        max_elapsed_seconds: 60,
-        budget: { max_model_calls: 4 }
-      }
-    });
-    assert.equal(research.error, undefined);
-    assert.equal(inputs[1].max_elapsed_seconds, 60);
-    assert.deepEqual(inputs[1].budget, { max_model_calls: 4 });
-    assert.equal(inputs[1].profile, "research");
-
-    const review = await client.callTool({
-      name: "pi_review",
-      arguments: {
-        request: "r",
-        max_cost: 1,
-        budget: { max_elapsed_seconds: 30 }
-      }
-    });
-    assert.equal(review.error, undefined);
-    assert.equal(inputs[2].max_cost, 1);
-    assert.deepEqual(inputs[2].budget, { max_elapsed_seconds: 30 });
-    assert.equal(inputs[2].profile, "review");
-
-    for (const bad of [0, -1]) {
-      const rejected = await client.callTool({
-        name: "pi_task",
-        arguments: { message: "go", max_elapsed_seconds: bad }
-      });
-      assert.equal(rejected.isError, true, "max_elapsed_seconds=" + bad + " must be rejected");
+    const cases = [
+      ["pi_task", { message: "go", max_elapsed_seconds: 120 }],
+      ["pi_task", { message: "go", max_model_calls: 5 }],
+      ["pi_task", { message: "go", max_cost: 0.5 }],
+      ["pi_research", { question: "q", budget: { max_model_calls: 4 } }],
+      ["pi_review", { request: "r", max_cost: 1 }]
+    ];
+    for (const [name, arguments_] of cases) {
+      const rejected = await client.callTool({ name, arguments: arguments_ });
+      assert.equal(rejected.isError, true, name + " must reject budget fields");
+      assert.match(rejected.content?.[0]?.text || "", /Unrecognized key/);
     }
-    const fractionalCalls = await client.callTool({
-      name: "pi_task",
-      arguments: { message: "go", max_model_calls: 2.5 }
-    });
-    assert.equal(fractionalCalls.isError, true, "max_model_calls must be an integer");
-    const oversized = await client.callTool({
-      name: "pi_task",
-      arguments: { message: "go", max_cost: 100000 }
-    });
-    assert.equal(oversized.isError, true, "max_cost must be bounded");
   });
+  assert.equal(inputs.length, 0, "a rejected budget field must never start Pi");
 });
 
 test("high-level failures return only a minimal terminal error", async () => {
@@ -270,7 +231,7 @@ test("session lifecycle tools keep their thin MCP mapping and pi_wait is answer-
 
     const waited = await client.callTool({
       name: "pi_wait",
-      arguments: { session_id: "session-1", run_id: "run-1", timeout_seconds: 30 }
+      arguments: { session_id: "session-1", run_id: "run-1" }
     });
     assert.equal(waited.structuredContent?.answer_meta?.has_answer, true);
     assert.equal(waited.structuredContent?.answer_meta?.truncated, false);
@@ -481,7 +442,7 @@ test("pi_wait accepts include_details and reflects it in the run snapshot", asyn
   await withClient(service, async (client) => {
     const result = await client.callTool({
       name: "pi_wait",
-      arguments: { session_id: "session-1", run_id: "run-1", timeout_seconds: 5, include_details: true }
+      arguments: { session_id: "session-1", run_id: "run-1", include_details: true }
     });
     assert.equal(calls[0].include_details, true);
     assert.equal(result.structuredContent?.result?.run?.recent_events?.length, 1);
@@ -491,7 +452,7 @@ test("pi_wait accepts include_details and reflects it in the run snapshot", asyn
   });
 });
 
-test("the default core toolset registers only synchronous expert workflows", async () => {
+test("the default core toolset registers expert workflows and continuation controls", async () => {
   // injectToolset: false keeps the service untouched, so the server's own
   // default (core, matching createConfig) is exercised.
   await withClient({ runOnce: async () => settledTask() }, async (client) => {
@@ -505,17 +466,17 @@ test("the default core toolset registers only synchronous expert workflows", asy
     // Compact, journey-first instructions: the fastest routes come first and
     // the core/full boundary stays truthful without enumerating tools.
     assert.ok(instructions.length < 460, "core instructions must stay compact (" + instructions.length + " chars)");
-    assert.match(instructions, /synchronously return one final answer/);
+    assert.match(instructions, /wait up to 10 minutes/);
     assert.match(instructions, /research and review are read-only/);
-    assert.ok(!instructions.includes("pi_wait"));
+    assert.match(instructions, /pi_wait/);
   }, { injectToolset: false });
 });
 
-test("the full toolset keeps advanced lifecycle tools while core stays at three", async () => {
+test("the full toolset keeps advanced lifecycle tools while core stays compact", async () => {
   const core = await withClient({ runOnce: async () => settledTask() }, async (client) => {
     const names = (await client.listTools()).tools.map((tool) => tool.name);
     assert.equal(names.length, CORE_TOOLSET_TOOLS.length);
-    assert.match(client.getInstructions() || "", /synchronously return one final answer/);
+    assert.match(client.getInstructions() || "", /wait up to 10 minutes/);
     const coreInstructions = client.getInstructions() || "";
     assert.ok(coreInstructions.length < 460, "core instructions must stay compact");
     return names;
@@ -524,14 +485,14 @@ test("the full toolset keeps advanced lifecycle tools while core stays at three"
   const full = await withClient({ runOnce: async () => settledTask() }, async (client) => {
     const tools = await client.listTools();
     const names = tools.tools.map((tool) => tool.name);
-    assert.equal(names.length, 20, "full must keep the complete 20-tool surface");
+    assert.equal(names.length, 21, "full must keep the complete 21-tool surface");
     for (const name of [...CORE_TOOLSET_TOOLS, ...FULL_ONLY_TOOLS]) {
       assert.ok(names.includes(name), "full must register " + name);
     }
     const fullInstructions = client.getInstructions() || "";
     assert.ok(fullInstructions.length < 460, "full instructions must stay compact (" + fullInstructions.length + " chars)");
-    assert.match(fullInstructions, /synchronously return one final answer/);
-    assert.match(fullInstructions, /explicit session, background, continuation, UI, and diagnostic controls/);
+    assert.match(fullInstructions, /wait up to 10 minutes/);
+    assert.match(fullInstructions, /explicit session, continuation, UI, and diagnostic controls/);
     return names;
   });
 
@@ -550,50 +511,55 @@ test("an explicit core toolset config registers the same surface as the default"
   }, { toolset: "core" });
 });
 
-test("budget exhaustion is a minimal high-level failure without lifecycle details", async () => {
+test("a high-level run can return a usable background continuation", async () => {
   const service = {
     runOnce: async () => ({
-      status: "failed",
+      status: "background",
       answer: null,
-      error: "Pi's max_model_calls budget was exhausted before a final answer was collected."
-    })
-  };
-  await withClient(service, async (client) => {
-    const result = await client.callTool({
-      name: "pi_task",
-      arguments: { message: "go", max_model_calls: 5 }
-    });
-    assert.equal(result.isError, true);
-    assert.deepEqual(result.structuredContent, { status: "failed", untrustedContent: true });
-    assert.match(result.content?.[0]?.text || "", /max_model_calls budget was exhausted/);
-    assert.equal(JSON.stringify(result).includes("continuation"), false);
-  });
-});
-
-test("elapsed and cost budget exhaustion get the same explicit no-answer treatment", async () => {
-  const service = {
-    wait: async () => ({
-      timed_out: false,
-      answer: null,
-      session: { session_id: "session-1" },
-      run: {
-        run_id: "run-1",
-        status: "error",
-        error: null,
-        budget: { max_elapsed_seconds: 30, max_model_calls: null, max_cost: null },
-        budget_exceeded: "elapsed",
-        pending_ui_requests: []
+      session_id: "session-1",
+      run_id: "run-1",
+      continuation: {
+        pi_wait: { session_id: "session-1", run_id: "run-1" },
+        pi_status: { session_id: "session-1" },
+        pi_kill_session: { session_id: "session-1" }
       }
     })
   };
   await withClient(service, async (client) => {
-    const result = await client.callTool({
-      name: "pi_wait",
-      arguments: { session_id: "session-1", run_id: "run-1", timeout_seconds: 5 }
+    const result = await client.callTool({ name: "pi_task", arguments: { message: "go" } });
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(result.structuredContent, {
+      status: "background",
+      session_id: "session-1",
+      run_id: "run-1",
+      continuation: {
+        pi_wait: { session_id: "session-1", run_id: "run-1" },
+        pi_status: { session_id: "session-1" },
+        pi_kill_session: { session_id: "session-1" }
+      },
+      untrustedContent: true
     });
-    const text = result.content?.[0]?.text || "";
-    assert.match(text, /max_elapsed_seconds=30 budget was exhausted/);
-    assert.match(text, /with a higher max_elapsed_seconds/);
-    assert.equal(result.structuredContent?.result?.run?.budget_exceeded, "elapsed");
+    assert.match(result.content?.[0]?.text || "", /continues in the background after the 10-minute synchronous window/);
+    assert.match(result.content?.[0]?.text || "", /pi_kill_session/);
   });
+});
+
+test("pi_kill_session maps the force-exit service operation", async () => {
+  const calls = [];
+  const service = {
+    killSession: async (input) => {
+      calls.push(input);
+      return { session_id: input.session_id, killed: true };
+    }
+  };
+  await withClient(service, async (client) => {
+    const result = await client.callTool({
+      name: "pi_kill_session",
+      arguments: { session_id: "session-1" }
+    });
+    assert.equal(result.isError, undefined);
+    assert.equal(result.structuredContent?.result?.killed, true);
+    assert.match(result.content?.[0]?.text || "", /Force-exited Pi session session-1/);
+  });
+  assert.deepEqual(calls, [{ session_id: "session-1" }]);
 });

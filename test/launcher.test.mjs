@@ -39,7 +39,7 @@ test("the smoke script locates the launcher relative to the checkout and expects
   assert.ok(smoke.includes("run-pi-wsl-mcp.cmd"), "the smoke script must use the renamed launcher");
   assert.ok(!smoke.includes("pi-local-mcp-smoke"), "the smoke client must use the new client name");
   assert.ok(smoke.includes("Pi WSL MCP"), "the smoke script must assert the renamed server");
-  assert.ok(smoke.includes("PI_WSL_MCP_TOOLSET: \"full\""), "the smoke must pin the full toolset because it asserts the 20-tool surface");
+  assert.ok(smoke.includes("PI_WSL_MCP_TOOLSET: \"full\""), "the smoke must pin the full toolset because it asserts the complete surface");
 });
 
 test("the smoke script passes the launcher path to cmd.exe without literal quote wrapping", () => {
@@ -62,10 +62,11 @@ test("the smoke script passes the launcher path to cmd.exe without literal quote
 });
 
 test("the launcher forwards every configuration variable through WSLENV", () => {
+  assert.ok(!launcher.includes("MAX_WAIT_SECONDS"), "the launcher must not forward a removed wait timeout");
   for (const name of [
     "PI_WSL_MCP_PKG", "PI_WSL_MCP_PI_BIN", "PI_WSL_MCP_DEFAULT_CWD",
     "PI_WSL_MCP_ALLOWED_ROOTS", "PI_WSL_MCP_SESSION_ROOT", "PI_WSL_MCP_MAX_SESSIONS",
-    "PI_WSL_MCP_MAX_WAIT_SECONDS", "PI_WSL_MCP_STARTUP_TIMEOUT_MS",
+    "PI_WSL_MCP_STARTUP_TIMEOUT_MS",
     "PI_WSL_MCP_COMMAND_TIMEOUT_MS", "PI_WSL_MCP_MAX_SAVED_SESSIONS",
     "PI_WSL_MCP_RESULT_LIMIT", "PI_WSL_MCP_HISTORY_LIMIT", "PI_WSL_MCP_TOOLSET"
   ]) {
@@ -73,7 +74,7 @@ test("the launcher forwards every configuration variable through WSLENV", () => 
   }
   for (const name of [
     "PI_LOCAL_MCP_PI_BIN", "PI_LOCAL_MCP_DEFAULT_CWD", "PI_LOCAL_MCP_ALLOWED_ROOTS",
-    "PI_LOCAL_MCP_SESSION_ROOT", "PI_LOCAL_MCP_MAX_SESSIONS", "PI_LOCAL_MCP_MAX_WAIT_SECONDS",
+    "PI_LOCAL_MCP_SESSION_ROOT", "PI_LOCAL_MCP_MAX_SESSIONS",
     "PI_LOCAL_MCP_STARTUP_TIMEOUT_MS", "PI_LOCAL_MCP_COMMAND_TIMEOUT_MS",
     "PI_LOCAL_MCP_MAX_SAVED_SESSIONS", "PI_LOCAL_MCP_RESULT_LIMIT", "PI_LOCAL_MCP_HISTORY_LIMIT",
     "PI_LOCAL_MCP_TOOLSET"

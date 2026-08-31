@@ -39,7 +39,7 @@ const bridge = useWindowsLauncher
     stdio: ["pipe", "pipe", "pipe"],
     shell: false,
     windowsHide: true,
-    // The smoke asserts the complete 20-tool protocol surface (it also calls
+    // The smoke asserts the complete 21-tool protocol surface (it also calls
     // full-only tools like pi_history/pi_start_session), so the bridge is
     // pinned to the full toolset. The launcher forwards this into WSL via
     // WSLENV.
@@ -181,29 +181,28 @@ try {
     assert.equal(listed.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.name, "Pi WSL MCP");
   }
   const names = listed.result?.tools?.map((tool) => tool.name) || [];
-  assert.equal(names.length, 20, "Pi WSL MCP should keep its 20-tool surface.");
-  for (const name of ["pi_info", "pi_task", "pi_research", "pi_review", "pi_resume_session"]) {
+  assert.equal(names.length, 21, "Pi WSL MCP should keep its 21-tool surface.");
+  for (const name of ["pi_info", "pi_task", "pi_research", "pi_review", "pi_wait", "pi_status", "pi_kill_session", "pi_resume_session"]) {
     assert.ok(names.includes(name), "Missing MCP tool " + name);
   }
   const taskTool = listed.result?.tools?.find((tool) => tool.name === "pi_task");
   const taskSchema = JSON.stringify(taskTool?.inputSchema || {});
   assert.ok(!taskSchema.includes('"session_id"'), "pi_task must be an ephemeral one-shot call.");
-  assert.ok(!taskSchema.includes('"auto_close"'), "pi_task closes its temporary session unconditionally.");
+  assert.ok(!taskSchema.includes('"auto_close"'), "pi_task manages the session lifecycle internally.");
   assert.ok(!taskSchema.includes('"wait_seconds"'), "pi_task must not expose async continuation controls.");
   assert.ok(!taskSchema.includes('"include_details"'), "pi_task must not expose diagnostics in its high-level result.");
-  assert.ok(taskSchema.includes('"max_elapsed_seconds"'), "pi_task must accept optional max_elapsed_seconds.");
-  assert.ok(taskSchema.includes('"max_model_calls"'), "pi_task must accept optional max_model_calls.");
-  assert.ok(taskSchema.includes('"max_cost"'), "pi_task must accept optional max_cost.");
+  assert.ok(!taskSchema.includes('"max_elapsed_seconds"'), "pi_task must not expose caller budgets.");
+  assert.ok(!taskSchema.includes('"max_model_calls"'), "pi_task must not expose caller budgets.");
+  assert.ok(!taskSchema.includes('"max_cost"'), "pi_task must not expose caller budgets.");
   const waitTool = listed.result?.tools?.find((tool) => tool.name === "pi_wait");
   const waitSchema = JSON.stringify(waitTool?.inputSchema || {});
-  assert.ok(waitSchema.includes('"timeout_seconds"'), "pi_wait must accept timeout_seconds.");
-  assert.ok(waitSchema.includes("300"), "timeout_seconds must stay schema-compatible through 300.");
+  assert.ok(!waitSchema.includes('"timeout_seconds"'), "pi_wait must not expose a caller timeout.");
   const reviewSchema = JSON.stringify(
     (listed.result?.tools?.find((tool) => tool.name === "pi_review")?.inputSchema) || {}
   );
   assert.ok(!reviewSchema.includes('"session_id"'));
   assert.ok(!reviewSchema.includes('"auto_close"'));
-  assert.ok(reviewSchema.includes('"max_model_calls"'), "pi_review must accept optional budgets.");
+  assert.ok(!reviewSchema.includes('"max_model_calls"'), "pi_review must not expose caller budgets.");
 
   const info = await request("tools/call", {
     name: "pi_info",
@@ -217,6 +216,7 @@ try {
   const payload = info.result?.structuredContent?.result;
   assert.ok(payload?.pi_bin?.endsWith("/pi"));
   assert.ok(Array.isArray(payload?.allowed_roots));
+  assert.equal(payload?.sync_window_seconds, 600);
   assert.equal(
     info.result?.structuredContent?.success,
     true,
@@ -403,8 +403,7 @@ try {
         name: "pi_wait",
         arguments: {
           session_id: liveSession.session_id,
-          run_id: run.run_id,
-          timeout_seconds: 120
+          run_id: run.run_id
         }
       }, 150000);
       assert.equal(waited.error, undefined);
@@ -441,7 +440,7 @@ try {
       const continuedRun = continued.result?.structuredContent?.result?.run_id;
       const continuedResult = await request("tools/call", {
         name: "pi_wait",
-        arguments: { session_id: liveSession.session_id, run_id: continuedRun, timeout_seconds: 120 }
+        arguments: { session_id: liveSession.session_id, run_id: continuedRun }
       }, 150000);
       assert.equal(continuedResult.error, undefined);
       assert.equal(continuedResult.result?.structuredContent?.result?.run?.status, "settled");

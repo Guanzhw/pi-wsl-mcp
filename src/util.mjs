@@ -269,8 +269,8 @@ export async function resolveExecutable(input, label = "executable", pathValue =
 }
 
 // PI_WSL_MCP_TOOLSET selects which MCP tool surface the bridge registers.
-// core (the default) registers only the daily-agent workflow tools; full
-// registers the complete 20-tool surface. Values are trimmed and
+// core (the default) registers the daily-agent workflow and continuation
+// tools; full registers the complete surface. Values are trimmed and
 // case-insensitive; anything else is a configuration error rather than a
 // silent fallback.
 export function toolsetSetting(input) {
@@ -315,17 +315,13 @@ export function createConfig(environment = process.env) {
     allowedRootInputs: allowedInputs.length > 0 ? allowedInputs : [cwd],
     sessionRootInput: value("SESSION_ROOT") || path.posix.join(home, ".pi", "agent", "sessions"),
     maxSessions: positiveInteger(value("MAX_SESSIONS"), 3, 1, 12),
-    // Advanced pi_wait remains bounded so it can return a continuation before
-    // a conservative host timeout. Synchronous high-level workflows do not use
-    // this limit; they await Pi's settlement event directly.
-    maxWaitSeconds: positiveInteger(value("MAX_WAIT_SECONDS"), 285, 5, 295),
     maxSavedSessions: positiveInteger(value("MAX_SAVED_SESSIONS"), 100, 1, 500),
     startupTimeoutMs: positiveInteger(value("STARTUP_TIMEOUT_MS"), 45000, 5000, 120000),
     commandTimeoutMs: positiveInteger(value("COMMAND_TIMEOUT_MS"), 30000, 1000, 120000),
     resultLimit: positiveInteger(value("RESULT_LIMIT"), 24000, 2000, 100000),
     historyLimit: positiveInteger(value("HISTORY_LIMIT"), 80, 1, 300),
-    // core (default) registers only the daily-agent workflow tools; full
-    // registers the complete 20-tool surface. PI_LOCAL_MCP_TOOLSET remains a
+    // core (default) registers the daily-agent workflow and continuation
+    // tools; full registers the complete surface. PI_LOCAL_MCP_TOOLSET remains a
     // deprecated alias with the same precedence rules as the other legacy names.
     toolset: toolsetSetting(value("TOOLSET"))
   };

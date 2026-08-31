@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { EOL_EXTENSION_PATH, PiRpcProcess, buildPiArgs } from "../src/pi-rpc.mjs";
 
@@ -127,4 +128,42 @@ test("PiRpcProcess waits for an extension UI response to reach stdin", async () 
     id: "confirm-1",
     confirmed: true
   });
+});
+
+test("PiRpcProcess.kill terminates immediately and rejects pending commands", async () => {
+  const rpc = new PiRpcProcess({
+    piBin: "/bin/true",
+    cwd: "/tmp",
+    profile: { id: "workspace", tools: null },
+    startupTimeoutMs: 1000,
+    commandTimeoutMs: 1000
+  });
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.killed = false;
+  child.kill = (signal) => {
+    child.killed = true;
+    child.signal = signal;
+    child.exitCode = 137;
+    queueMicrotask(() => child.emit("exit", null, signal));
+    return true;
+  };
+  rpc.child = child;
+  const pending = new Promise((resolve, reject) => {
+    rpc.pending.set("request-1", {
+      resolve,
+      reject,
+      timer: setTimeout(() => reject(new Error("pending command was not rejected")), 1000)
+    });
+  });
+
+  await rpc.kill();
+  await assert.rejects(pending, (error) => {
+    assert.equal(error.code, "pi_session_killed");
+    return true;
+  });
+  assert.equal(rpc.closed, true);
+  assert.equal(child.killed, true);
+  assert.equal(child.signal, "SIGKILL");
+  assert.equal(rpc.pending.size, 0);
 });
