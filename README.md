@@ -28,9 +28,10 @@ child process, and invent its own way to find or continue a durable session.
 This project turns that workflow into a convenient local MCP entry point. An
 ordinary task becomes one tool call, saved work stays findable and reopenable
 across restarts, and live work has explicit wait, status, steer, close, and
-force-exit controls. Pi still owns its runtime, extensions, transcripts, and model setup;
-direct Pi CLI use remains available for Pi-specific administration such as
-installing or removing extensions.
+force-exit controls. Pi still owns its runtime, extensions, transcripts, and model catalog;
+the bridge selects its documented default model for new sessions. Direct Pi CLI
+use remains available for Pi-specific administration such as installing or
+removing extensions.
 
 ## How it evolved
 
@@ -244,9 +245,12 @@ persistent conversation or deliberately steered background task, select
 `full` and use pi_start_session plus pi_send. Close the live process with
 pi_close_session when finished.
 
-`pi_review` deliberately defaults to DeepSeek Pro for stronger review quality.
-`pi_research` leaves its model unset so Pi can use its own current default;
-either workflow accepts an explicit provider and model when needed.
+The bridge defaults `pi_task`, `pi_research`, `pi_review`, and newly started
+sessions to the official `deepseek/deepseek-v4-flash-vision-exp` model. This is
+the default execution and review model. `deepseek/deepseek-v4-pro` is reserved
+for an explicitly requested second pass in a multi-review or high-risk change;
+the bridge does not select that escalation automatically. Each workflow still
+accepts an explicit provider and model when needed.
 
 ## Release-matrix review example
 
@@ -392,12 +396,13 @@ arbitrary user can run the bridge with zero setup.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | PI_WSL_MCP_PI_BIN | `pi` on PATH | Pi command; resolved through the interactive zsh PATH unless set |
+| Bridge default model | `deepseek/deepseek-v4-flash-vision-exp` | Default provider/model for new sessions and high-level workflows |
 | PI_WSL_MCP_DEFAULT_CWD | bridge working directory | Default workspace |
 | PI_WSL_MCP_ALLOWED_ROOTS | bridge working directory | Semicolon-separated allowed workspace roots |
 | PI_WSL_MCP_SESSION_ROOT | $HOME/.pi/agent/sessions | Pi's saved-session store |
 | PI_WSL_MCP_MAX_SESSIONS | 3 | Concurrent live Pi processes |
 | PI_WSL_MCP_STARTUP_TIMEOUT_MS | 45000 | Pi startup acknowledgement timeout |
-| PI_WSL_MCP_COMMAND_TIMEOUT_MS | 30000 | Individual Pi RPC acknowledgement timeout |
+| PI_WSL_MCP_COMMAND_TIMEOUT_MS | 120000 | Individual Pi RPC acknowledgement timeout; internal transport safeguard |
 | PI_WSL_MCP_MAX_SAVED_SESSIONS | 100 | Saved sessions returned by pi_sessions at most |
 | PI_WSL_MCP_RESULT_LIMIT | 24000 | Bounds the final Pi answer in `content[0].text` and every nested diagnostic string; truncation is explicit |
 | PI_WSL_MCP_HISTORY_LIMIT | 80 | Bounded history entry count |

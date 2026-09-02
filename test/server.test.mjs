@@ -69,8 +69,8 @@ test("high-level Pi workflows expose a direct, answer-first untrusted result", a
 
   assert.equal(taskInputs.length, 1);
   assert.equal(taskInputs[0].profile, "review");
-  assert.equal(taskInputs[0].provider, "deepseek");
-  assert.equal(taskInputs[0].model, "deepseek-v4-pro");
+  assert.equal(taskInputs[0].provider, undefined);
+  assert.equal(taskInputs[0].model, undefined);
   assert.equal(taskInputs[0].wait_seconds, undefined);
 });
 
@@ -207,7 +207,7 @@ test("session lifecycle tools keep their thin MCP mapping and pi_wait is answer-
   await withClient(service, async (client) => {
     const started = await client.callTool({
       name: "pi_start_session",
-      arguments: { profile: "review", provider: "deepseek", model: "deepseek-v4-flash" }
+      arguments: { profile: "review", provider: "deepseek", model: "deepseek-v4-flash-vision-exp" }
     });
     assert.equal(started.structuredContent?.result?.session_id, "session-1");
 

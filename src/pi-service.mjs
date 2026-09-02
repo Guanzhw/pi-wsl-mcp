@@ -7,6 +7,8 @@ import {
   canonicalRoots,
   createConfig,
   createId,
+  DEFAULT_PI_MODEL,
+  DEFAULT_PI_PROVIDER,
   normalizeWslPath,
   PiWslError,
   readFirstLine,
@@ -642,6 +644,7 @@ function trackStopState(job, message) {
 export class PiService {
   constructor(config = createConfig()) {
     this.config = config;
+    this.rpcFactory = config.rpcFactory || ((options) => new PiRpcProcess(options));
     this.allowedRoots = [];
     this.defaultWorkspace = "";
     this.sessionRoot = "";
@@ -675,6 +678,8 @@ export class PiService {
       session_root: this.sessionRoot,
       max_live_sessions: this.config.maxSessions,
       sync_window_seconds: DEFAULT_SYNC_WINDOW_MS / 1000,
+      default_provider: this.config.defaultProvider || DEFAULT_PI_PROVIDER,
+      default_model: this.config.defaultModel || DEFAULT_PI_MODEL,
       profiles: Object.values(PROFILES).map((profile) => ({
         id: profile.id,
         title: profile.title,
@@ -898,7 +903,13 @@ export class PiService {
     }
     const workspace = await this.resolveWorkspace(input.workspace);
     const profile = profileFor(input.profile);
-    const rpc = new PiRpcProcess({
+    if ((input.provider === undefined) !== (input.model === undefined)) {
+      throw new PiWslError("invalid_model", "provider and model must be set together.");
+    }
+    const restoringSession = input.sessionPath !== undefined;
+    const provider = input.provider ?? (restoringSession ? undefined : this.config.defaultProvider ?? DEFAULT_PI_PROVIDER);
+    const model = input.model ?? (restoringSession ? undefined : this.config.defaultModel ?? DEFAULT_PI_MODEL);
+    const rpc = this.rpcFactory({
       piBin: this.config.piBin,
       cwd: workspace,
       profile,
@@ -923,14 +934,11 @@ export class PiService {
       const stateResponse = await rpc.start();
       this.syncState(session, stateResponse);
       session.lifecycle = "running";
-      if (input.provider || input.model) {
-        if (!input.provider || !input.model) {
-          throw new PiWslError("invalid_model", "provider and model must be set together.");
-        }
+      if (provider !== undefined && model !== undefined) {
         const modelResponse = await rpc.command({
           type: "set_model",
-          provider: input.provider,
-          modelId: input.model
+          provider,
+          modelId: model
         });
         session.state = { ...session.state, model: modelResponse.data };
       }

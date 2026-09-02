@@ -216,6 +216,8 @@ try {
   const payload = info.result?.structuredContent?.result;
   assert.ok(payload?.pi_bin?.endsWith("/pi"));
   assert.ok(Array.isArray(payload?.allowed_roots));
+  assert.equal(payload?.default_provider, "deepseek");
+  assert.equal(payload?.default_model, "deepseek-v4-flash-vision-exp");
   assert.equal(payload?.sync_window_seconds, 600);
   assert.equal(
     info.result?.structuredContent?.success,
@@ -228,8 +230,6 @@ try {
       name: "pi_research",
       arguments: {
         question: "Use the web_search tool exactly once to search for the official Model Context Protocol site. Return the title and direct URL of one result, and say that the search tool was used.",
-        provider: "deepseek",
-        model: "deepseek-v4-flash"
       }
     }, 3600000);
     assert.equal(research.error, undefined);
@@ -342,8 +342,6 @@ try {
       const workspaceTask = await request("tools/call", {
         name: "pi_task",
         arguments: {
-          provider: "deepseek",
-          model: "deepseek-v4-flash",
           message: "Use the read tool to inspect package.json in the current workspace. Return only the package name. Do not modify files or run commands."
         }
       }, 3600000);
@@ -369,8 +367,6 @@ try {
         name: "pi_start_session",
         arguments: {
           profile: "review",
-          provider: "deepseek",
-          model: "deepseek-v4-flash"
         }
       });
       assert.equal(started.error, undefined);
@@ -378,13 +374,16 @@ try {
       assert.equal(liveSession?.lifecycle, "running");
       assert.equal(liveSession?.profile, "review");
 
+      // Vision model prompt acknowledgements can exceed the smoke harness's
+      // default 30-second envelope timeout; this is test-only, not a caller
+      // budget or a production API setting.
       const sent = await request("tools/call", {
         name: "pi_send",
         arguments: {
           session_id: liveSession.session_id,
           message: "Use the read tool to inspect package.json. Return only its package name. Do not modify files or run commands."
         }
-      });
+      }, 150000);
       assert.equal(sent.error, undefined);
       const run = sent.result?.structuredContent?.result;
       assert.equal(run?.prompt_kind, "prompt");
@@ -435,7 +434,7 @@ try {
           session_id: liveSession.session_id,
           message: "Re-check package.json using the read tool and return only its package name."
         }
-      });
+      }, 150000);
       assert.equal(continued.error, undefined);
       const continuedRun = continued.result?.structuredContent?.result?.run_id;
       const continuedResult = await request("tools/call", {

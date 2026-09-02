@@ -3,6 +3,12 @@ import { constants as fsConstants, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// The bridge's default model policy is intentionally explicit: the official
+// DeepSeek Vision Flash model handles ordinary execution and review, while Pro
+// remains an opt-in escalation for a second review pass.
+export const DEFAULT_PI_PROVIDER = "deepseek";
+export const DEFAULT_PI_MODEL = "deepseek-v4-flash-vision-exp";
+
 const SENSITIVE_KEY = /(?:api[_-]?key|authorization|bearer|cookie|credential|pass(?:word)?|secret|token)/i;
 const SECRET_ASSIGNMENT = /((?:api[_ -]?key|authorization|bearer|cookie|credential|pass(?:word)?|secret|token)\s*[:=]\s*)(?:(?:Bearer)\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"',}\]]+)/gi;
 const BEARER_VALUE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
@@ -311,13 +317,18 @@ export function createConfig(environment = process.env) {
     // Default: the `pi` command through the interactive zsh PATH this bridge
     // inherits. Set PI_WSL_MCP_PI_BIN only to point elsewhere.
     piBin: value("PI_BIN") || "pi",
+    defaultProvider: DEFAULT_PI_PROVIDER,
+    defaultModel: DEFAULT_PI_MODEL,
     defaultWorkspace: value("DEFAULT_CWD") || cwd,
     allowedRootInputs: allowedInputs.length > 0 ? allowedInputs : [cwd],
     sessionRootInput: value("SESSION_ROOT") || path.posix.join(home, ".pi", "agent", "sessions"),
     maxSessions: positiveInteger(value("MAX_SESSIONS"), 3, 1, 12),
     maxSavedSessions: positiveInteger(value("MAX_SAVED_SESSIONS"), 100, 1, 500),
     startupTimeoutMs: positiveInteger(value("STARTUP_TIMEOUT_MS"), 45000, 5000, 120000),
-    commandTimeoutMs: positiveInteger(value("COMMAND_TIMEOUT_MS"), 30000, 1000, 120000),
+    // Vision model prompt acknowledgements can take longer than the old
+    // 30-second default; keep this as an internal RPC safeguard, not a caller
+    // task budget.
+    commandTimeoutMs: positiveInteger(value("COMMAND_TIMEOUT_MS"), 120000, 1000, 120000),
     resultLimit: positiveInteger(value("RESULT_LIMIT"), 24000, 2000, 100000),
     historyLimit: positiveInteger(value("HISTORY_LIMIT"), 80, 1, 300),
     // core (default) registers the daily-agent workflow and continuation

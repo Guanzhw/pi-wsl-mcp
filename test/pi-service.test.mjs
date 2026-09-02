@@ -1,9 +1,91 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { EventEmitter } from "node:events";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_SYNC_WINDOW_MS, PROFILES, PiService, actionableRunError, jobSnapshot, liveDirectoryEntry, savedDirectoryEntry, runProgress, runStats, usageFromMessage } from "../src/pi-service.mjs";
+
+function fakeRpc(calls, sessionId) {
+  const rpc = new EventEmitter();
+  rpc.protocolWarnings = [];
+  rpc.start = async () => ({ data: { sessionId } });
+  rpc.command = async (command) => {
+    calls.push(command);
+    return { data: { provider: command.provider, id: command.modelId } };
+  };
+  rpc.close = async () => {};
+  return rpc;
+}
+
+test("new sessions select the Vision Flash default and allow explicit model overrides", async () => {
+  const calls = [];
+  let nextSession = 0;
+  const service = new PiService({
+    maxSessions: 3,
+    piBin: "pi",
+    defaultProvider: "deepseek",
+    defaultModel: "deepseek-v4-flash-vision-exp",
+    resultLimit: 1000,
+    rpcFactory: () => fakeRpc(calls, "pi-test-" + (++nextSession))
+  });
+  service.resolveWorkspace = async () => "/workspace";
+
+  const defaultSession = await service.startSession({ profile: "workspace" });
+  assert.deepEqual(calls[0], {
+    type: "set_model",
+    provider: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp"
+  });
+  assert.deepEqual(defaultSession.model, { provider: "deepseek", id: "deepseek-v4-flash-vision-exp" });
+
+  const overrideSession = await service.startSession({
+    profile: "review",
+    provider: "deepseek",
+    model: "deepseek-v4-pro"
+  });
+  assert.deepEqual(calls[1], { type: "set_model", provider: "deepseek", modelId: "deepseek-v4-pro" });
+  assert.deepEqual(overrideSession.model, { provider: "deepseek", id: "deepseek-v4-pro" });
+
+  await assert.rejects(
+    service.startSession({ profile: "review", provider: "deepseek" }),
+    (error) => error.code === "invalid_model"
+  );
+  assert.equal(calls.length, 2, "a one-sided model selection must be rejected before starting Pi");
+});
+
+test("resuming a saved session preserves its model unless a complete override is supplied", async () => {
+  const calls = [];
+  let nextSession = 0;
+  const service = new PiService({
+    maxSessions: 3,
+    piBin: "pi",
+    defaultProvider: "deepseek",
+    defaultModel: "deepseek-v4-flash-vision-exp",
+    resultLimit: 1000,
+    rpcFactory: () => fakeRpc(calls, "pi-resume-" + (++nextSession))
+  });
+  service.resolveWorkspace = async () => "/workspace";
+  service.findSavedSession = async () => ({
+    workspace: "/workspace",
+    session_file: "/saved.jsonl",
+    pi_session_id: "saved-1",
+    created_at: "2026-08-01T00:00:00.000Z"
+  });
+
+  const preserved = await service.resume({ saved_session_id: "saved-1", profile: "workspace" });
+  assert.equal(preserved.session.model, null);
+  assert.equal(calls.length, 0, "resume without an override must not silently change the saved model");
+
+  const overridden = await service.resume({
+    saved_session_id: "saved-1",
+    profile: "review",
+    provider: "deepseek",
+    model: "deepseek-v4-pro"
+  });
+  assert.deepEqual(calls[0], { type: "set_model", provider: "deepseek", modelId: "deepseek-v4-pro" });
+  assert.deepEqual(overridden.session.model, { provider: "deepseek", id: "deepseek-v4-pro" });
+});
 
 function activeJob(overrides = {}) {
   return {
@@ -164,7 +246,7 @@ test("status defaults to a compact live/job snapshot and opts into bounded diagn
     job: settledJob(),
     rpc: {
       protocolWarnings: [],
-      command: async () => ({ data: { model: { provider: "deepseek", id: "deepseek-v4-flash" }, thinkingLevel: "low" } })
+      command: async () => ({ data: { model: { provider: "deepseek", id: "deepseek-v4-flash-vision-exp" }, thinkingLevel: "low" } })
     }
   };
   const service = {
@@ -672,7 +754,7 @@ test("usageFromMessage extracts billed assistant usage and rejects synthetic emp
   assert.deepEqual(usageFromMessage({
     role: "assistant",
     provider: "deepseek",
-    model: "deepseek-v4-flash",
+    model: "deepseek-v4-flash-vision-exp",
     usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, reasoning: 3, totalTokens: 18, cost: { total: 0.01 } }
   }), { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, reasoning: 3, total: 18, cost: 0.01 });
   // totalTokens missing -> computed from the parts.
@@ -692,7 +774,7 @@ test("assistant message_end usage is aggregated exactly once; turn_end never dou
   const first = {
     role: "assistant",
     provider: "deepseek",
-    model: "deepseek-v4-flash",
+    model: "deepseek-v4-flash-vision-exp",
     usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, reasoning: 3, totalTokens: 18, cost: { total: 0.01 } }
   };
   service.handleEvent({ job }, usageEvent(first));
@@ -705,7 +787,7 @@ test("assistant message_end usage is aggregated exactly once; turn_end never dou
   assert.equal(stats.cost, 0.03);
   assert.equal(stats.models.length, 2);
   assert.deepEqual(stats.models[0], { provider: "deepseek", model: "deepseek-v4-pro", model_calls: 1, usage_total: 5, cost: 0.02 });
-  assert.deepEqual(stats.models[1], { provider: "deepseek", model: "deepseek-v4-flash", model_calls: 1, usage_total: 18, cost: 0.01 });
+  assert.deepEqual(stats.models[1], { provider: "deepseek", model: "deepseek-v4-flash-vision-exp", model_calls: 1, usage_total: 18, cost: 0.01 });
   assert.ok(stats.elapsed_ms > 0, "an active run reports elapsed time so timeout snapshots remain useful");
 });
 

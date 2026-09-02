@@ -133,7 +133,8 @@ Responses 原生 `web_search` 的进程；Pi RPC 还会明确排除该同名工�
 5. 受控 CRLF fixture 经 EOL guard 的 `write` 输入仍为 CRLF，LF fixture 仍为 LF；
    混合/二进制/new-file fixture 不被擅自改写。对桥接仓库执行 `git diff --check` 和
    `git ls-files --eol`，确认没有意外全仓行尾翻转。
-6. 独立 Pi `deepseek-v4-pro` 审查当前 diff；其发现由源码、测试和真实协议结果复核
+6. 默认使用 `deepseek-v4-flash-vision-exp` 执行和审查；仅在多方 review 或高风险
+   变更的二审中显式使用 `deepseek-v4-pro`，其发现由源码、测试和真实协议结果复核
    后再决定是否修正。
 
 ## 非目标

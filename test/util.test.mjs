@@ -68,12 +68,14 @@ test("bounds large arrays and parses semicolon-delimited allowed roots", () => {
 test("config defaults derive from the actual WSL home and working directory", () => {
   const config = createConfig({ HOME: "/home/alice" });
   assert.equal(config.piBin, "pi", "the pi command resolves through the interactive zsh PATH by default");
+  assert.equal(config.defaultProvider, "deepseek");
+  assert.equal(config.defaultModel, "deepseek-v4-flash-vision-exp");
   assert.equal(config.defaultWorkspace, process.cwd());
   assert.deepEqual(config.allowedRootInputs, [process.cwd()]);
   assert.equal(config.sessionRootInput, "/home/alice/.pi/agent/sessions");
   assert.equal(config.maxSessions, 3);
   assert.equal(config.startupTimeoutMs, 45000);
-  assert.equal(config.commandTimeoutMs, 30000);
+  assert.equal(config.commandTimeoutMs, 120000);
   assert.equal(config.maxSavedSessions, 100);
   assert.equal(config.resultLimit, 24000);
   assert.equal(config.historyLimit, 80);
